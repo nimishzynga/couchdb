@@ -36,6 +36,26 @@
         [exit_status, use_stdio, stderr_to_stdout, {line, 4096}, binary]).
 
 
+do_n1ql_map(#doc{body = Doc0}) ->
+    Doc = binary:replace(Doc0, <<"\"">>, <<"\\\"">>, [global]),
+    Expr = erlang:get(expr),
+    URL = "http://localhost:10000/queryDoc",
+    PostBody = <<"{
+                 \"DocData\" : ", "\"", Doc/binary, "\"",
+                 ", \"DocExpr\": ", Expr/binary,
+                 "}">>,
+    {ok, {Status, _, Body}} =
+        lhttpc:request(URL, "POST", [{"Content-Type", "application/json"}], PostBody, 1000),
+    ?LOG_INFO("http req result ~p ~p ~p", [Status, Body, byte_size(Body)]),
+    case byte_size(Body) of
+    2 ->
+        R = [];
+    _ ->
+        R = [[{<<Body/binary>>,<<"null">>}]]
+    end,
+    {ok, R}.
+
+
 -spec update(pid(), #set_view_group{},
              partition_seqs(), boolean(), string(), [term()]) -> no_return().
 update(Owner, Group, CurSeqs, CompactorRunning, TmpDir, Options) ->
@@ -732,7 +752,9 @@ do_maps(Group, MapQueue, WriteQueue) ->
                     deleted = false
                 },
                 try
-                    {ok, Result} = couch_set_view_mapreduce:map(Doc),
+                    {ok, Result} = do_n1ql_map(Doc),
+                    %{ok, Result} = couch_set_view_mapreduce:map(Doc),
+                    % ?LOG_INFO("map:result ~p", [Result]),
                     {Result2, _} = lists:foldr(
                         fun({error, Reason}, {AccRes, Pos}) ->
                             ErrorMsg = "Bucket `~s`, ~s group `~s`, error mapping"

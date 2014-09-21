@@ -57,9 +57,16 @@ start_map_context(_MapFunSources, _Ref) ->
     erlang:nif_error(mapreduce_nif_not_loaded).
 
 
-map_doc(_Context, _Doc, _Meta) ->
+map_doc(_Context, _Doc, _Meta, _Pid) ->
     erlang:nif_error(mapreduce_nif_not_loaded).
-
+map_doc(Context, Doc, Meta) ->
+    ok = map_doc(Context, Doc, Meta, self()),
+    receive
+    {ok, KVMap} ->
+        {ok, KVMap};
+    {error, Reason} ->
+        {error, Reason}
+    end.
 
 start_reduce_context(ReduceFunSources) ->
     Ref = erlang:phash2(make_ref()),

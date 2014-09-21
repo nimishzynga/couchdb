@@ -36,8 +36,27 @@
     } while(0)
 #endif
 
+#ifdef WIN32
+static unsigned int ATOMIC_ADD(volatile unsigned int *dest,
+                               unsigned int value) {
+    LONG old = InterlockedExchangeAdd((LPLONG)dest, (LONG)value);
+    return (unsigned int) old;
+}
+#elif defined(HAVE_ATOMIC_H) && defined(__SUNPRO_C)
+#include <atomic.h>
+static inline unsigned int ATOMIC_ADD(volatile unsigned int *dest,
+                                      unsigned int value) {
+    return atomic_add_int(dest, value);
+}
+#else
+#define ATOMIC_ADD(i, by) __sync_fetch_and_add(i, by)
+#endif
+
 #include "erl_nif_compat.h"
 #include "mapreduce.h"
+
+#define MAX_MAP_TASKS   4
+#define MAP_QUEUE_SIZE  16
 
 // NOTE: keep this file clean (without knowledge) of any V8 APIs
 
@@ -46,12 +65,15 @@ static ERL_NIF_TERM ATOM_ERROR;
 
 // maxTaskDuration is in seconds
 static volatile int                                maxTaskDuration = 5;
+static volatile unsigned int                       workerTurn = 0;
 static int                                         maxKvSize = 1 * 1024 * 1024;
 static ErlNifResourceType                          *MAP_REDUCE_CTX_RES;
 static ErlNifTid                                   terminatorThreadId;
 static ErlNifMutex                                 *terminatorMutex;
 static volatile int                                shutdownTerminator = 0;
 static std::map< unsigned int, map_reduce_ctx_t* > contexts;
+static ErlNifTid                                   *mapTaskThreadIds;
+static TaskQueue< map_task_arg_t* >                **mapTaskQueues;
 
 
 // NIF API functions
@@ -73,10 +95,13 @@ static bool parseFunctions(ErlNifEnv *env, ERL_NIF_TERM functionsArg, function_s
 
 // NIF resource functions
 static void free_map_reduce_context(ErlNifEnv *env, void *res);
-
+static void free_map_task(map_task_arg_t **t);
 static inline void registerContext(map_reduce_ctx_t *ctx, ErlNifEnv *env, const ERL_NIF_TERM &refTerm);
 static inline void unregisterContext(map_reduce_ctx_t *ctx);
 static void *terminatorLoop(void *);
+static void *doMapDocLoop(void *arg);
+static void destroyQueues();
+static void finishThreads();
 
 
 
@@ -89,7 +114,7 @@ ERL_NIF_TERM startMapContext(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     }
 
     map_reduce_ctx_t *ctx = static_cast<map_reduce_ctx_t *>(
-        enif_alloc_resource(MAP_REDUCE_CTX_RES, sizeof(map_reduce_ctx_t)));
+            enif_alloc_resource(MAP_REDUCE_CTX_RES, sizeof(map_reduce_ctx_t)));
 
     try {
         initContext(ctx, mapFunctions);
@@ -97,6 +122,7 @@ ERL_NIF_TERM startMapContext(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         ERL_NIF_TERM res = enif_make_resource(env, ctx);
         enif_release_resource(ctx);
 
+        ctx->workerId = ATOMIC_ADD(&workerTurn, 1) % MAX_MAP_TASKS;
         registerContext(ctx, env, argv[1]);
 
         return enif_make_tuple2(env, ATOM_OK, res);
@@ -111,70 +137,113 @@ ERL_NIF_TERM startMapContext(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
 
 ERL_NIF_TERM doMapDoc(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 {
-    map_reduce_ctx_t *ctx;
+    map_task_arg_t *t = static_cast< map_task_arg_t* >
+        (enif_alloc(sizeof(map_task_arg_t)));
 
-    if (!enif_get_resource(env, argv[0], MAP_REDUCE_CTX_RES, reinterpret_cast<void **>(&ctx))) {
-        return enif_make_badarg(env);
-    }
-    ctx->env = env;
-    ctx->maxEmitKvSize = maxKvSize;
-
-    ErlNifBinary docBin;
-
-    if (!enif_inspect_iolist_as_binary(env, argv[1], &docBin)) {
-        return enif_make_badarg(env);
-    }
-
-    ErlNifBinary metaBin;
-
-    if (!enif_inspect_iolist_as_binary(env, argv[2], &metaBin)) {
-        return enif_make_badarg(env);
-    }
-
-    try {
-        // Map results is a list of lists. An inner list is the list of key value
-        // pairs emitted by a map function for the document.
-        map_results_list_t mapResults = mapDoc(ctx, docBin, metaBin);
-        ERL_NIF_TERM outerList = enif_make_list(env, 0);
-        map_results_list_t::reverse_iterator i = mapResults.rbegin();
-
-        for ( ; i != mapResults.rend(); ++i) {
-            map_result_t mapResult = *i;
-
-            switch (mapResult.type) {
-            case MAP_KVS:
-                {
-                    ERL_NIF_TERM kvList = enif_make_list(env, 0);
-                    kv_pair_list_t::reverse_iterator j = mapResult.result.kvs->rbegin();
-
-                    for ( ; j != mapResult.result.kvs->rend(); ++j) {
-                        ERL_NIF_TERM key = enif_make_binary(env, &j->first);
-                        ERL_NIF_TERM value = enif_make_binary(env, &j->second);
-                        ERL_NIF_TERM kvPair = enif_make_tuple2(env, key, value);
-                        kvList = enif_make_list_cell(env, kvPair, kvList);
-                    }
-                    mapResult.result.kvs->~kv_pair_list_t();
-                    enif_free(mapResult.result.kvs);
-                    outerList = enif_make_list_cell(env, kvList, outerList);
-                }
-                break;
-            case MAP_ERROR:
-                ERL_NIF_TERM reason = enif_make_binary(env, mapResult.result.error);
-                ERL_NIF_TERM errorTuple = enif_make_tuple2(env, ATOM_ERROR, reason);
-
-                enif_free(mapResult.result.error);
-                outerList = enif_make_list_cell(env, errorTuple, outerList);
-                break;
-            }
-        }
-
-        return enif_make_tuple2(env, ATOM_OK, outerList);
-
-    } catch(MapReduceError &e) {
-        return makeError(env, e.getMsg());
-    } catch(std::bad_alloc &) {
+    if (t == NULL) {
         return makeError(env, "memory allocation failure");
     }
+
+    t->env = enif_alloc_env();
+    if (t->env == NULL) {
+        enif_free(t);
+        return makeError(env, "memory allocation failure");
+    }
+
+    if (!enif_get_resource(env, argv[0], MAP_REDUCE_CTX_RES,
+                reinterpret_cast<void **>(&(t->ctx)))) {
+        return enif_make_badarg(env);
+    }
+
+    if (!enif_inspect_iolist_as_binary(t->env, argv[1], &(t->docBin))) {
+        return enif_make_badarg(t->env);
+    }
+
+    if (!enif_inspect_iolist_as_binary(t->env, argv[2], &(t->metaBin))) {
+        return enif_make_badarg(t->env);
+    }
+
+    if(!enif_get_local_pid(t->env, argv[3], &(t->pid))) {
+        return enif_make_badarg(t->env);
+    }
+
+    mapTaskQueues[t->ctx->workerId]->enqueue(t);
+
+    return ATOM_OK;
+}
+
+void *doMapDocLoop(void *arg)
+{
+    TaskQueue< map_task_arg_t* > *q = static_cast< TaskQueue
+        < map_task_arg_t* >* >(arg);
+
+    while (true) {
+        map_task_arg_t *t = q->dequeue();
+
+        if (t == NULL) {
+            break;
+        }
+
+        t->ctx->maxEmitKvSize = maxKvSize;
+
+        try {
+            // Map results is a list of lists. An inner list is the list of
+            // key value pairs emitted by a map function for the document.
+            map_results_list_t mapResults = mapDoc(t->ctx, t->docBin,
+                    t->metaBin);
+            ERL_NIF_TERM outerList = enif_make_list(t->env, 0);
+            map_results_list_t::reverse_iterator i = mapResults.rbegin();
+
+            for ( ; i != mapResults.rend(); ++i) {
+                map_result_t mapResult = *i;
+
+                switch (mapResult.type) {
+                    case MAP_KVS:
+                        {
+                            ERL_NIF_TERM kvList = enif_make_list(t->env, 0);
+                            kv_pair_list_t::reverse_iterator j =
+                                mapResult.result.kvs->rbegin();
+
+                            for ( ; j != mapResult.result.kvs->rend(); ++j) {
+                                ERL_NIF_TERM key =
+                                    enif_make_binary(t->env, &j->first);
+                                ERL_NIF_TERM value =
+                                    enif_make_binary(t->env, &j->second);
+                                ERL_NIF_TERM kvPair =
+                                    enif_make_tuple2(t->env, key, value);
+                                kvList =
+                                    enif_make_list_cell(t->env, kvPair, kvList);
+                            }
+                            mapResult.result.kvs->~kv_pair_list_t();
+                            enif_free(mapResult.result.kvs);
+                            outerList = enif_make_list_cell(t->env, kvList,
+                                    outerList);
+                        }
+                        break;
+                    case MAP_ERROR:
+                        ERL_NIF_TERM reason =
+                            enif_make_binary(t->env, mapResult.result.error);
+                        ERL_NIF_TERM errorTuple =
+                            enif_make_tuple2(t->env, ATOM_ERROR, reason);
+
+                        enif_free(mapResult.result.error);
+                        outerList = enif_make_list_cell(t->env, errorTuple,
+                                outerList);
+                        break;
+                }
+            }
+            enif_send(NULL, &(t->pid), t->env,
+                    enif_make_tuple2(t->env, ATOM_OK, outerList));
+        } catch(MapReduceError &e) {
+            enif_send(NULL, &(t->pid), t->env, makeError(t->env, e.getMsg()));
+        } catch(std::bad_alloc &) {
+            enif_send(NULL, &(t->pid), t->env,
+                    makeError(t->env, "memory allocation failure"));
+        }
+        free_map_task(&t);
+    }
+
+    return NULL;
 }
 
 
@@ -187,7 +256,7 @@ ERL_NIF_TERM startReduceContext(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
     }
 
     map_reduce_ctx_t *ctx = static_cast<map_reduce_ctx_t *>(
-        enif_alloc_resource(MAP_REDUCE_CTX_RES, sizeof(map_reduce_ctx_t)));
+            enif_alloc_resource(MAP_REDUCE_CTX_RES, sizeof(map_reduce_ctx_t)));
 
     try {
         initContext(ctx, reduceFunctions);
@@ -366,12 +435,12 @@ int onLoad(ErlNifEnv *env, void **priv, ERL_NIF_TERM info)
     ATOM_ERROR = enif_make_atom(env, "error");
 
     MAP_REDUCE_CTX_RES = enif_open_resource_type(
-        env,
-        NULL,
-        "map_reduce_context",
-        free_map_reduce_context,
-        ERL_NIF_RT_CREATE,
-        NULL);
+            env,
+            NULL,
+            "map_reduce_context",
+            free_map_reduce_context,
+            ERL_NIF_RT_CREATE,
+            NULL);
 
     if (MAP_REDUCE_CTX_RES == NULL) {
         return -1;
@@ -383,12 +452,51 @@ int onLoad(ErlNifEnv *env, void **priv, ERL_NIF_TERM info)
     }
 
     if (enif_thread_create(const_cast<char *>("terminator thread"),
-                           &terminatorThreadId,
-                           terminatorLoop,
-                           NULL,
-                           NULL) != 0) {
+                &terminatorThreadId,
+                terminatorLoop,
+                NULL,
+                NULL) != 0) {
         enif_mutex_destroy(terminatorMutex);
         return -4;
+    }
+
+    try {
+        mapTaskQueues = new TaskQueue< map_task_arg_t* >*[MAX_MAP_TASKS];
+        for (unsigned int i = 0; i < MAX_MAP_TASKS; i++) {
+            mapTaskQueues[i] = NULL;
+        }
+        mapTaskThreadIds = new ErlNifTid[MAX_MAP_TASKS];
+    } catch (std::bad_alloc e) {
+        destroyQueues();
+        return -5;
+    }
+
+    for (unsigned int i = 0; i < MAX_MAP_TASKS; i++) {
+        try {
+            mapTaskQueues[i] = new TaskQueue< map_task_arg_t* >(MAP_QUEUE_SIZE);
+        } catch(std::bad_alloc e) {
+            for (unsigned int j = 0; j < i; j++) {
+                void *result = NULL;
+                mapTaskQueues[j]->enqueue(NULL);
+                enif_thread_join(mapTaskThreadIds[j], &result);
+            }
+            destroyQueues();
+
+            return -5;
+        }
+        if (enif_thread_create(const_cast<char*>("doMapDocLoop"),
+                    &mapTaskThreadIds[i], doMapDocLoop,
+                    static_cast<void *>(mapTaskQueues[i]),
+                    NULL) != 0) {
+            for (unsigned int j = 0; j < i; j++) {
+                void *result = NULL;
+                mapTaskQueues[j]->enqueue(NULL);
+                enif_thread_join(mapTaskThreadIds[j], &result);
+            }
+            destroyQueues();
+
+            return -5;
+        }
     }
 
     return 0;
@@ -402,6 +510,8 @@ void onUnload(ErlNifEnv *env, void *priv_data)
     shutdownTerminator = 1;
     enif_thread_join(terminatorThreadId, &result);
     enif_mutex_destroy(terminatorMutex);
+    finishThreads();
+    destroyQueues();
 }
 
 
@@ -447,14 +557,46 @@ ERL_NIF_TERM makeError(ErlNifEnv *env, const std::string &msg)
     }
 }
 
+void free_map_task(map_task_arg_t **t)
+{
+    enif_free_env((*t)->env);
+    enif_free(*t);
+    *t = NULL;
+}
 
-void free_map_reduce_context(ErlNifEnv *env, void *res) {
+void free_map_reduce_context(ErlNifEnv *env, void *res)
+{
     map_reduce_ctx_t *ctx = static_cast<map_reduce_ctx_t *>(res);
 
     unregisterContext(ctx);
     destroyContext(ctx);
 }
 
+void destroyQueues()
+{
+    if (mapTaskQueues != NULL) {
+        for (unsigned int i = 0; i < MAX_MAP_TASKS; i++) {
+            if (mapTaskQueues[i] != NULL) {
+                delete mapTaskQueues[i];
+            }
+        }
+        delete [] mapTaskQueues;
+    }
+    if (mapTaskThreadIds != NULL) {
+        delete [] mapTaskThreadIds;
+    }
+}
+
+
+void finishThreads()
+{
+    void *result = NULL;
+
+    for (unsigned int i = 0; i < MAX_MAP_TASKS; i++) {
+        mapTaskQueues[i]->enqueue(NULL);
+        enif_thread_join(mapTaskThreadIds[i], &result);
+    }
+}
 
 void *terminatorLoop(void *args)
 {
@@ -506,7 +648,7 @@ void unregisterContext(map_reduce_ctx_t *ctx)
 
 static ErlNifFunc nif_functions[] = {
     {"start_map_context", 2, startMapContext},
-    {"map_doc", 3, doMapDoc},
+    {"map_doc", 4, doMapDoc},
     {"start_reduce_context", 2, startReduceContext},
     {"reduce", 2, doReduce},
     {"reduce", 3, doReduce},
