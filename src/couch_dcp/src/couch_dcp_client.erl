@@ -20,6 +20,7 @@
 -export([get_stream_event/2, remove_stream/2, list_streams/1]).
 -export([enum_docs_since/8, restart_worker/1]).
 -export([get_seqs_async/1, parse_stats_seqnos/1]).
+-export([receive_events/7, enum_docs_since_async/4]).
 
 % gen_server callbacks
 -export([init/1, terminate/2, handle_call/3, handle_cast/2, handle_info/2, code_change/3]).
@@ -222,6 +223,11 @@ get_stream_event_get_reply(Pid, ReqId, MRef) ->
         get_stream_event_get_reply(Pid, ReqId, MRef)
     end.
 
+enum_docs_since_async(Pid, PartIdList, CallbackFn, InAcc) ->
+    [enum_docs_since(Pid, PartId, PartVersions, StartSeq, EndSeq0, Flags,
+        CallbackFn, InAcc) || {PartId, PartVersions, StartSeq, EndSeq0, Flags}
+        <- PartIdList].
+
 -spec enum_docs_since(pid(), partition_id(), partition_version(), update_seq(),
                       update_seq(), 0..255, mutations_fold_fun(),
                       mutations_fold_acc()) ->
@@ -258,12 +264,9 @@ enum_docs_since(Pid, PartId, PartVersions, StartSeq, EndSeq0, Flags,
                 {error, too_large_failover_log};
             false ->
                 InAcc2 = CallbackFn({part_versions, {PartId, FailoverLog}}, InAcc),
-                case receive_events(Pid, RequestId, CallbackFn, InAcc2) of
-                {ok, InAcc3} ->
-                    {ok, InAcc3, FailoverLog};
-                Error ->
-                    Error
-                end
+                ParentPid = self(),
+                spawn_link(couch_dcp_client, receive_events, [Pid, RequestId, CallbackFn,
+                    InAcc2, PartId, ParentPid, FailoverLog])
             end;
         {error, vbucket_stream_not_found} ->
             enum_docs_since(Pid, PartId, PartVersionsRest, StartSeq, EndSeq,
@@ -880,21 +883,26 @@ receive_stat(BufSocket, Timeout, Status, BodyLength, KeyLength) ->
     end.
 
 -spec receive_events(pid(), request_id(), mutations_fold_fun(),
-                     mutations_fold_acc()) -> {ok, mutations_fold_acc()} |
-                                              {error, term()}.
-receive_events(Pid, RequestId, CallbackFn, InAcc) ->
+        mutations_fold_acc(), partition_id(), pid(),
+        partition_version()) -> {ok, mutations_fold_acc()} |
+                                {error, term()}.
+receive_events(Pid, RequestId, CallbackFn, InAcc, PartId, ParentPid,
+        FailoverLog) ->
     {Optype, Data} = get_stream_event(Pid, RequestId),
     case Optype of
     stream_end ->
-        {ok, InAcc};
+        ParentPid ! {stream_result, InAcc, PartId, FailoverLog};
     snapshot_marker ->
-        InAcc2 = CallbackFn({snapshot_marker, Data}, InAcc),
-        receive_events(Pid, RequestId, CallbackFn, InAcc2);
+        Data2 = {Data, PartId},
+        InAcc2 = CallbackFn({snapshot_marker, Data2}, InAcc),
+        receive_events(Pid, RequestId, CallbackFn, InAcc2, PartId, ParentPid,
+            FailoverLog);
     error ->
-        {error, Data};
+        ParentPid ! {error, Data};
     _ ->
         InAcc2 = CallbackFn(Data, InAcc),
-        receive_events(Pid, RequestId, CallbackFn, InAcc2)
+        receive_events(Pid, RequestId, CallbackFn, InAcc2, PartId, ParentPid,
+            FailoverLog)
     end.
 
 -spec socket_send(socket(), iodata()) ->

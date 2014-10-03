@@ -14,7 +14,7 @@
 
 -module(couch_set_view_updater).
 
--export([update/6]).
+-export([update/6, update_task/1]).
 % Exported for the MapReduce specific stuff
 -export([new_sort_file_name/1]).
 % Exported for unit tests only.
@@ -402,6 +402,36 @@ dcp_marker_to_string(Type) ->
         io_lib:format("unknown (~w)", [Type])
     end.
 
+filter_dcp_partitions(PartIds, Group, SinceSeqs, AccVersions, InitialBuild) ->
+    FilterFun = fun({PartId, EndSeq}, Acc) ->
+        case couch_set_view_util:has_part_seq(PartId, ?set_unindexable_seqs(Group))
+            andalso not lists:member(PartId, ?set_replicas_on_transfer(Group)) of
+        true ->
+            Acc;
+        false ->
+            Since = couch_util:get_value(PartId, SinceSeqs, 0),
+            PartVersions = couch_util:get_value(PartId, AccVersions),
+            Flags = case InitialBuild of
+            true ->
+                ?DCP_FLAG_DISKONLY;
+            false ->
+                ?DCP_FLAG_NOFLAG
+            end,
+            Flags2 = case PartVersions of
+            [{0, 0}] ->
+                Flags bor ?DCP_FLAG_USELATEST_ENDSEQNO;
+            _ ->
+                Flags
+            end,
+            case EndSeq =:= Since of
+            true ->
+                Acc;
+            false ->
+                Acc ++ [{PartId, PartVersions, Since, EndSeq, Flags2}]
+            end
+        end
+    end,
+    lists:foldl(FilterFun, [], PartIds).
 
 load_changes(Owner, Updater, Group, MapQueue, ActiveParts, PassiveParts,
         EndSeqs, InitialBuild) ->
@@ -417,133 +447,77 @@ load_changes(Owner, Updater, Group, MapQueue, ActiveParts, PassiveParts,
         category = Category
     } = Group,
 
+    DcpChangesFun = fun({_AccCount, _AccSeqs, AccVersions, _AccRollbacks} = AccInit, AllSeqs) ->
     MaxDocSize = list_to_integer(
         couch_config:get("set_views", "indexer_max_doc_size", "0")),
-    FoldFun = fun({PartId, EndSeq}, {AccCount, AccSeqs, AccVersions, AccRollbacks}) ->
-        case couch_set_view_util:has_part_seq(PartId, ?set_unindexable_seqs(Group))
-            andalso not lists:member(PartId, ?set_replicas_on_transfer(Group)) of
-        true ->
-            {AccCount, AccSeqs, AccVersions, AccRollbacks};
-        false ->
-            Since = couch_util:get_value(PartId, SinceSeqs, 0),
-            PartVersions = couch_util:get_value(PartId, AccVersions),
-            Flags = case InitialBuild of
-            true ->
-                ?DCP_FLAG_DISKONLY;
-            false ->
-                ?DCP_FLAG_NOFLAG
-            end,
-            % For stream request from 0, If a vbucket got reset in the window
-            % of time between seqno was obtained from stats and stream request
-            % was made, the end_seqno may be higher than current vb high seqno.
-            % Use a special flag to tell server to set end_seqno.
-            Flags2 = case PartVersions of
-            [{0, 0}] ->
-                Flags bor ?DCP_FLAG_USELATEST_ENDSEQNO;
-            _ ->
-                Flags
-            end,
-            case AccRollbacks of
-            [] ->
-                case EndSeq =:= Since of
-                true ->
-                    {AccCount, AccSeqs, AccVersions, AccRollbacks};
-                false ->
-                    ChangesWrapper = fun
-                        ({part_versions, _} = NewVersions, Acc) ->
-                            queue_doc(
-                                NewVersions, MapQueue, Group,
-                                MaxDocSize, InitialBuild),
-                            Acc;
-                        ({snapshot_marker, {MarkerStartSeq, MarkerEndSeq, MarkerType}}, {Count, _})
-                            when MarkerType band ?DCP_SNAPSHOT_TYPE_MASK =/= 0 ->
-                            ?LOG_INFO(
-                                "set view `~s`, ~s (~s) group `~s`: received "
-                                "a snapshot marker (~s) for partition ~p from "
-                                "sequence ~p to ~p",
-                                [SetName, GroupType, Category, DDocId,
-                                    dcp_marker_to_string(MarkerType),
-                                    PartId, MarkerStartSeq, MarkerEndSeq]),
-                            case Count of
-                            % Ignore the snapshot marker that is at the
-                            % beginning of the stream.
-                            % If it wasn't ignored, it would lead to an
-                            % additional forced flush which isn't needed. A
-                            % flush is needed if there are several mutations
-                            % of the same document within one batch. As two
-                            % different partitions can't contain the same
-                            % document ID, we are safe to not force flushing
-                            % between two partitions.
-                            0 ->
-                                {Count, MarkerEndSeq};
-                            _ ->
-                                queue_doc(
-                                    snapshot_marker, MapQueue, Group,
-                                    MaxDocSize, InitialBuild),
-                                {Count, MarkerEndSeq}
-                            end;
-                        ({snapshot_marker, {MarkerStartSeq, MarkerEndSeq, MarkerType}}, Acc) ->
-                            ?LOG_ERROR(
-                                "set view `~s`, ~s (~s) group `~s`: received "
-                                "a snapshot marker (~s) for partition ~p from "
-                                "sequence ~p to ~p",
-                                [SetName, GroupType, Category, DDocId,
-                                    dcp_marker_to_string(MarkerType),
-                                    PartId, MarkerStartSeq, MarkerEndSeq]),
-                            throw({error, unknown_snapshot_marker, MarkerType}),
-                            Acc;
-                        (#dcp_doc{} = Item, {Count, AccEndSeq}) ->
-                            queue_doc(
-                                Item, MapQueue, Group,
-                                MaxDocSize, InitialBuild),
-                            {Count + 1, AccEndSeq}
-                        end,
-                    Result = couch_dcp_client:enum_docs_since(
-                        DcpPid, PartId, PartVersions, Since, EndSeq, Flags2,
-                        ChangesWrapper, {0, 0}),
-                    case Result of
-                    {ok, {AccCount2, AccEndSeq}, NewPartVersions} ->
-                        AccSeqs2 = orddict:store(PartId, AccEndSeq, AccSeqs),
-                        AccVersions2 = lists:ukeymerge(
-                            1, [{PartId, NewPartVersions}], AccVersions),
-                        AccRollbacks2 = AccRollbacks;
-                    {rollback, RollbackSeq} ->
-                        AccCount2 = AccCount,
-                        AccSeqs2 = AccSeqs,
-                        AccVersions2 = AccVersions,
-                        AccRollbacks2 = ordsets:add_element(
-                            {PartId, RollbackSeq}, AccRollbacks);
-                    Error ->
-                        AccCount2 = AccCount,
-                        AccSeqs2 = AccSeqs,
-                        AccVersions2 = AccVersions,
-                        AccRollbacks2 = AccRollbacks,
-                        ?LOG_ERROR("set view `~s`, ~s (~s) group `~s` error"
-                            "while loading changes for partition ~p:~n~p~n",
-                            [SetName, GroupType, Category, DDocId, PartId,
-                                Error]),
-                        throw(Error)
-                    end,
-                    {AccCount2, AccSeqs2, AccVersions2, AccRollbacks2}
+
+        %AllSeqs = couch_set_view_util:filter_seqs(ActiveParts, EndSeqs),
+        PartIdList = filter_dcp_partitions(AllSeqs, Group, SinceSeqs, AccVersions,
+            InitialBuild),
+        ?LOG_INFO("dcp partition filtered ~p~n", [PartIdList]),
+
+        ChangesWrapper = fun
+            ({part_versions, _} = NewVersions, Acc) ->
+                queue_doc(
+                    NewVersions, MapQueue, Group,
+                    MaxDocSize, InitialBuild),
+                Acc;
+            ({snapshot_marker, {{MarkerStartSeq, MarkerEndSeq, MarkerType}, PartId}}, {Count, _})
+                when MarkerType band ?DCP_SNAPSHOT_TYPE_MASK =/= 0 ->
+                ?LOG_INFO(
+                    "set view `~s`, ~s (~s) group `~s`: received "
+                    "a snapshot marker (~s) for partition ~p from "
+                    "sequence ~p to ~p",
+                    [SetName, GroupType, Category, DDocId,
+                        dcp_marker_to_string(MarkerType),
+                        PartId, MarkerStartSeq, MarkerEndSeq]),
+                case Count of
+                % Ignore the snapshot marker that is at the
+                % beginning of the stream.
+                % If it wasn't ignored, it would lead to an
+                % additional forced flush which isn't needed. A
+                % flush is needed if there are several mutations
+                % of the same document within one batch. As two
+                % different partitions can't contain the same
+                % document ID, we are safe to not force flushing
+                % between two partitions.
+                0 ->
+                    {Count, MarkerEndSeq};
+                _ ->
+                    queue_doc(
+                        snapshot_marker, MapQueue, Group,
+                        MaxDocSize, InitialBuild),
+                    {Count, MarkerEndSeq}
                 end;
-            _ ->
-                % If there is a rollback needed, don't store any new documents
-                % in the index, but just check for a rollback of another
-                % partition (i.e. a request with start seq == end seq)
-                ChangesWrapper = fun(_, _) -> ok end,
-                Result = couch_dcp_client:enum_docs_since(
-                    DcpPid, PartId, PartVersions, Since, Since, Flags2,
-                    ChangesWrapper, ok),
-                case Result of
-                {ok, _, _} ->
-                    AccRollbacks2 = AccRollbacks;
-                {rollback, RollbackSeq} ->
-                    AccRollbacks2 = ordsets:add_element(
-                        {PartId, RollbackSeq}, AccRollbacks)
-                end,
-                {AccCount, AccSeqs, AccVersions, AccRollbacks2}
-            end
-        end
+            ({snapshot_marker, {{MarkerStartSeq, MarkerEndSeq, MarkerType}, PartId}}, Acc) ->
+                ?LOG_ERROR(
+                    "set view `~s`, ~s (~s) group `~s`: received "
+                    "a snapshot marker (~s) for partition ~p from "
+                    "sequence ~p to ~p",
+                    [SetName, GroupType, Category, DDocId,
+                        dcp_marker_to_string(MarkerType),
+                        PartId, MarkerStartSeq, MarkerEndSeq]),
+                throw({error, unknown_snapshot_marker, MarkerType}),
+                Acc;
+            (#dcp_doc{} = Item, {Count, AccEndSeq}) ->
+                queue_doc(
+                    Item, MapQueue, Group,
+                    MaxDocSize, InitialBuild),
+                {Count + 1, AccEndSeq}
+            end,
+
+            couch_dcp_client:enum_docs_since_async(
+                DcpPid, PartIdList, ChangesWrapper, {0, 0}),
+
+            lists:foldl(fun(_Element, {_AccCount1, AccSeqs, AccVersions1, AccRollbacks}) ->
+            receive
+            {stream_result, {AccCount2, AccEndSeq}, PartId1, NewPartVersions} ->
+                AccSeqs2 = orddict:store(PartId1, AccEndSeq, AccSeqs),
+                AccVersions2 = lists:ukeymerge(
+                    1, [{PartId1, NewPartVersions}], AccVersions1),
+                AccRollbacks2 = AccRollbacks,
+                {AccCount2, AccSeqs2, AccVersions2, AccRollbacks2}
+            end end, AccInit, PartIdList)
     end,
 
     notify_owner(Owner, {state, updating_active}, Updater),
@@ -557,9 +531,9 @@ load_changes(Owner, Updater, Group, MapQueue, ActiveParts, PassiveParts,
         ?LOG_INFO("Updater reading changes from active partitions to "
                   "update ~s set view group `~s` from set `~s`",
                   [GroupType, DDocId, SetName]),
-        {ActiveChangesCount, MaxSeqs, PartVersions, Rollbacks} = lists:foldl(
-            FoldFun, {0, orddict:new(), PartVersions0, ordsets:new()},
-            couch_set_view_util:filter_seqs(ActiveParts, EndSeqs))
+        {ActiveChangesCount, MaxSeqs, PartVersions, Rollbacks} =
+            DcpChangesFun({0, orddict:new(), PartVersions0, ordsets:new()},
+                couch_set_view_util:filter_seqs(ActiveParts, EndSeqs))
     end,
     case PassiveParts of
     [] ->
@@ -571,13 +545,13 @@ load_changes(Owner, Updater, Group, MapQueue, ActiveParts, PassiveParts,
         ?LOG_INFO("Updater reading changes from passive partitions to "
                   "update ~s set view group `~s` from set `~s`",
                   [GroupType, DDocId, SetName]),
-        {FinalChangesCount, MaxSeqs2, PartVersions2, Rollbacks2} = lists:foldl(
-            FoldFun, {ActiveChangesCount, MaxSeqs, PartVersions, Rollbacks},
-            couch_set_view_util:filter_seqs(PassiveParts, EndSeqs))
+        {FinalChangesCount, MaxSeqs2, PartVersions2, Rollbacks2} =
+            DcpChangesFun({ActiveChangesCount, MaxSeqs, PartVersions, Rollbacks},
+                couch_set_view_util:filter_seqs(PassiveParts, EndSeqs))
     end,
     {FinalChangesCount3, MaxSeqs3, PartVersions3, Rollbacks3} =
         load_changes_from_passive_parts_in_mailbox(DcpPid,
-            Group, FoldFun, FinalChangesCount, MaxSeqs2, PartVersions2, Rollbacks2),
+            Group, DcpChangesFun, FinalChangesCount, MaxSeqs2, PartVersions2, Rollbacks2),
 
     case Rollbacks3 of
     [] ->
@@ -595,7 +569,7 @@ load_changes(Owner, Updater, Group, MapQueue, ActiveParts, PassiveParts,
 
 
 load_changes_from_passive_parts_in_mailbox(DcpPid,
-        Group, FoldFun, ChangesCount, MaxSeqs0, PartVersions0, Rollbacks) ->
+        Group, DcpChangesFun, ChangesCount, MaxSeqs0, PartVersions0, Rollbacks) ->
     #set_view_group{
         set_name = SetName,
         name = DDocId,
@@ -612,14 +586,14 @@ load_changes_from_passive_parts_in_mailbox(DcpPid,
         ?LOG_INFO("Updater reading changes from new passive partitions ~w to "
                   "update ~s set view group `~s` from set `~s`",
                   [Parts, GroupType, DDocId, SetName]),
-        {ChangesCount2, MaxSeqs2, PartVersions2, Rollbacks2} = lists:foldl(
-            FoldFun, {ChangesCount, MaxSeqs, PartVersions, Rollbacks}, AddMaxSeqs),
+        {ChangesCount2, MaxSeqs2, PartVersions2, Rollbacks2} =
+            DcpChangesFun({ChangesCount, MaxSeqs, PartVersions, Rollbacks},
+                AddMaxSeqs),
         load_changes_from_passive_parts_in_mailbox(DcpPid,
-            Group, FoldFun, ChangesCount2, MaxSeqs2, PartVersions2, Rollbacks2)
+            Group, DcpChangesFun, ChangesCount2, MaxSeqs2, PartVersions2, Rollbacks2)
     after 0 ->
         {ChangesCount, MaxSeqs0, PartVersions0, Rollbacks}
     end.
-
 
 get_more_passive_partitions(Parts) ->
     receive
@@ -680,8 +654,8 @@ queue_doc(Doc, MapQueue, Group, MaxDocSize, InitialBuild) ->
     nil ->
         ok;
     _ ->
-        couch_work_queue:queue(MapQueue, Entry),
-        update_task(1)
+        couch_work_queue:queue(MapQueue, Entry)
+        %update_task(1)
     end.
 
 
