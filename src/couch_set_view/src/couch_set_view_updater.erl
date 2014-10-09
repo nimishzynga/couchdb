@@ -509,14 +509,19 @@ load_changes(Owner, Updater, Group, MapQueue, ActiveParts, PassiveParts,
             couch_dcp_client:enum_docs_since_async(
                 DcpPid, PartIdList, ChangesWrapper, {0, 0}),
 
-            lists:foldl(fun(_Element, {_AccCount1, AccSeqs, AccVersions1, AccRollbacks}) ->
+            lists:foldl(fun(_Element, {AccCount1, AccSeqs, AccVersions1, AccRollbacks}) ->
             receive
             {stream_result, {AccCount2, AccEndSeq}, PartId1, NewPartVersions} ->
                 AccSeqs2 = orddict:store(PartId1, AccEndSeq, AccSeqs),
                 AccVersions2 = lists:ukeymerge(
                     1, [{PartId1, NewPartVersions}], AccVersions1),
                 AccRollbacks2 = AccRollbacks,
-                {AccCount2, AccSeqs2, AccVersions2, AccRollbacks2}
+                {AccCount2, AccSeqs2, AccVersions2, AccRollbacks2};
+            {stream_result, {rollback, RollbackSeq}, PartId1} ->
+                ?LOG_INFO("Rollback requested in view updater ~n", []),
+                AccRollbacks2 = ordsets:add_element(
+                    {PartId1, RollbackSeq}, AccRollbacks),
+                {AccCount1, AccSeqs, AccVersions1, AccRollbacks2}
             end end, AccInit, PartIdList)
     end,
 

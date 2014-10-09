@@ -271,7 +271,7 @@ enum_docs_since(Pid, PartId, PartVersions, StartSeq, EndSeq0, Flags,
             enum_docs_since(Pid, PartId, PartVersions, StartSeq, EndSeq,
                 Flags, CallbackFn, InAcc);
         _ ->
-            Resp
+            self() ! {stream_result, Resp}
         end
     end.
 
