@@ -374,6 +374,7 @@ demonitor_partition_update(Mod, SetName, DDocId, Ref) ->
 % (from all the active/passive partitions) to index.
 -spec trigger_update(atom(), binary(), binary(), non_neg_integer()) -> no_return().
 trigger_update(Mod, SetName, DDocId, MinNumChanges) ->
+    ?LOG_INFO("trigger update called inside view ~n", []),
     try
         Pid = get_group_pid(Mod, SetName, DDocId, prod),
         ok = gen_server:cast(Pid, {update, MinNumChanges})
@@ -386,6 +387,7 @@ trigger_update(Mod, SetName, DDocId, MinNumChanges) ->
 % changes (from all the currently defined replica partitions) to index.
 -spec trigger_replica_update(atom(), binary(), binary(), non_neg_integer()) -> no_return().
 trigger_replica_update(Mod, SetName, DDocId, MinNumChanges) ->
+    ?LOG_INFO("trigger replica update called inside view ~n", []),
     try
         Pid = get_group_pid(Mod, SetName, DDocId, prod),
         ok = gen_server:cast(Pid, {update_replica, MinNumChanges})

@@ -39,6 +39,8 @@
 -spec update(pid(), #set_view_group{},
              partition_seqs(), boolean(), string(), [term()]) -> no_return().
 update(Owner, Group, CurSeqs, CompactorRunning, TmpDir, Options) ->
+    Trace = try throw(42) catch 42 -> erlang:get_stacktrace() end,
+    ?LOG_INFO("updater stared with trace ~p~n", [Trace]),
     #set_view_group{
         set_name = SetName,
         type = Type,
