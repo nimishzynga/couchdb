@@ -85,7 +85,7 @@ init([]) ->
         end),
 
     Filename = couch_config:get("log", "file", "couchdb.log"),
-    Level = level_integer(list_to_atom(couch_config:get("log", "level", "info"))),
+    Level = level_integer(list_to_atom("info")),
     Sasl = couch_config:get("log", "include_sasl", "true") =:= "true",
 
     case ets:info(?MODULE) of
