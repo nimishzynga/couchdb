@@ -999,24 +999,31 @@ handle_cast(before_master_delete, State) ->
     {stop, shutdown, State2};
 
 handle_cast({update, MinNumChanges}, #state{group = Group} = State) ->
+    ?LOG_INFO("inside update wth changes ~p~n", [MinNumChanges]),
     case is_pid(State#state.updater_pid) of
     true ->
+        ?LOG_INFO(" returned since updater was running~n", []),
         {noreply, State};
     false ->
+        ?LOG_INFO(" not returned since updater was running~n", []),
         CurSeqs = indexable_partition_seqs(State),
         MissingCount = couch_set_view_util:missing_changes_count(CurSeqs, ?set_seqs(Group)),
         case (MissingCount >= MinNumChanges) andalso (MissingCount > 0) of
         true ->
+            ?LOG_INFO("condition check is true ~p~p ~n", [MissingCount, MinNumChanges]),
             {noreply, do_start_updater(State, CurSeqs, [])};
         false ->
+            ?LOG_INFO("condition check is false ~p~p ~n", [MissingCount, MinNumChanges]),
             {noreply, State}
         end
     end;
 
 handle_cast({update_replica, _MinNumChanges}, #state{replica_group = nil} = State) ->
+    ?LOG_INFO("replica group is nill, so returning ~n", []),
     {noreply, State};
 
 handle_cast({update_replica, MinNumChanges}, #state{replica_group = Pid} = State) ->
+    ?LOG_INFO("replica group is updating ~n", []),
     ok = gen_server:cast(Pid, {update, MinNumChanges}),
     {noreply, State}.
 
