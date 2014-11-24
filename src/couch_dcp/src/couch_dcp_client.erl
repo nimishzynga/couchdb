@@ -20,7 +20,7 @@
 -export([get_stream_event/2, remove_stream/2, list_streams/1]).
 -export([enum_docs_since/8, restart_worker/1]).
 -export([get_seqs_async/1, parse_stats_seqnos/1]).
--export([receive_events/7, enum_docs_since_async/4]).
+-export([receive_events/7, enum_docs_since_async/4, enum_docs_since_sync/8]).
 
 % gen_server callbacks
 -export([init/1, terminate/2, handle_call/3, handle_cast/2, handle_info/2, code_change/3]).
@@ -231,14 +231,10 @@ enum_docs_since_async(Pid, PartIdList, CallbackFn, InAcc) ->
 -spec enum_docs_since(pid(), partition_id(), partition_version(), update_seq(),
                       update_seq(), 0..255, mutations_fold_fun(),
                       mutations_fold_acc()) ->
-                             {error, vbucket_stream_not_found |
-                              wrong_start_sequence_number |
-                              too_large_failover_log } |
-                             {rollback, update_seq()} |
-                             {ok, mutations_fold_acc(), partition_version()}.
-enum_docs_since(_, _, [], _, _, _, _, _) ->
+                        pid() | {'stream_result',{'error',_}} | {'stream_result',_,_}.
+enum_docs_since(_, PartId, [], _, _, _, _, _) ->
     % No matching partition version found. Recreate the index from scratch
-    {rollback, 0};
+    self() ! {stream_result, {rollback, 0}, PartId};
 enum_docs_since(Pid, PartId, PartVersions, StartSeq, EndSeq0, Flags,
         CallbackFn, InAcc) ->
     [PartVersion | PartVersionsRest] = PartVersions,
@@ -255,13 +251,13 @@ enum_docs_since(Pid, PartId, PartVersions, StartSeq, EndSeq0, Flags,
 
     case add_stream(Pid, PartId, PartUuid, StartSeq, EndSeq, Flags) of
     {error, _} = Error ->
-        Error;
+        self() ! {stream_result, Error};
     {RequestId, Resp} ->
         case Resp of
         {failoverlog, FailoverLog} ->
             case length(FailoverLog) > ?DCP_MAX_FAILOVER_LOG_SIZE of
             true ->
-                {error, too_large_failover_log};
+                self() ! {stream_result, {error, too_large_failover_log}, PartId};
             false ->
                 InAcc2 = CallbackFn({part_versions, {PartId, FailoverLog}}, InAcc),
                 ParentPid = self(),
@@ -278,10 +274,25 @@ enum_docs_since(Pid, PartId, PartVersions, StartSeq, EndSeq0, Flags,
             enum_docs_since(Pid, PartId, PartVersions, StartSeq, EndSeq,
                 Flags, CallbackFn, InAcc);
         _ ->
-            Resp
+            io:format("Sending message from client3 ~n", []),
+            self() ! {stream_result, Resp, PartId}
         end
     end.
 
+enum_docs_since_sync(Pid, PartId, PartVersions, StartSeq, EndSeq0, Flags,
+    CallbackFn, InAcc) ->
+    enum_docs_since(Pid, PartId, PartVersions, StartSeq, EndSeq0,
+        Flags, CallbackFn, InAcc),
+    receive
+    {stream_result, InAcc2, _PartId1, FailoverLog} ->
+        {ok, InAcc2, FailoverLog};
+    {stream_result, {error, _} = Error} ->
+        Error;
+    {stream_result, Resp, _PartId1} ->
+        Resp;
+    {stream_result, Data} ->
+        Data
+    end.
 
 % gen_server callbacks
 
@@ -884,8 +895,8 @@ receive_stat(BufSocket, Timeout, Status, BodyLength, KeyLength) ->
 
 -spec receive_events(pid(), request_id(), mutations_fold_fun(),
         mutations_fold_acc(), partition_id(), pid(),
-        partition_version()) -> {ok, mutations_fold_acc()} |
-                                {error, term()}.
+        partition_version()) -> {stream_result,_,_} |
+                {stream_result,_,_,_}.
 receive_events(Pid, RequestId, CallbackFn, InAcc, PartId, ParentPid,
         FailoverLog) ->
     {Optype, Data} = get_stream_event(Pid, RequestId),
@@ -898,7 +909,7 @@ receive_events(Pid, RequestId, CallbackFn, InAcc, PartId, ParentPid,
         receive_events(Pid, RequestId, CallbackFn, InAcc2, PartId, ParentPid,
             FailoverLog);
     error ->
-        ParentPid ! {error, Data};
+        ParentPid ! {stream_result, Data, PartId};
     _ ->
         InAcc2 = CallbackFn(Data, InAcc),
         receive_events(Pid, RequestId, CallbackFn, InAcc2, PartId, ParentPid,

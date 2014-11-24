@@ -14,7 +14,7 @@
 
 -module(couch_set_view_updater).
 
--export([update/6, update_task/1]).
+-export([update/6, update_task/2]).
 % Exported for the MapReduce specific stuff
 -export([new_sort_file_name/1]).
 % Exported for unit tests only.
@@ -243,18 +243,21 @@ update(WriterAcc, ActiveParts, PassiveParts, BlockedTime,
 
     DocLoader = spawn_link(fun() ->
         DDocIds = couch_set_view_util:get_ddoc_ids_with_sig(SetName, Group),
-        couch_task_status:add_task([
-            {type, indexer},
-            {set, SetName},
-            {signature, ?l2b(couch_util:to_hex(GroupSig))},
-            {design_documents, DDocIds},
-            {indexer_type, Type},
-            {progress, 0},
-            {changes_done, 0},
-            {initial_build, InitialBuild},
-            {total_changes, NumChanges2}
-        ]),
-        couch_task_status:set_update_frequency(5000),
+        StatsPid = spawn_link(fun() ->
+            couch_task_status:add_task([
+                {type, indexer},
+                {set, SetName},
+                {signature, ?l2b(couch_util:to_hex(GroupSig))},
+                {design_documents, DDocIds},
+                {indexer_type, Type},
+                {progress, 0},
+                {changes_done, 0},
+                {initial_build, InitialBuild},
+                {total_changes, NumChanges2}
+            ]),
+            couch_task_status:set_update_frequency(5000),
+                receive_update_task(0, NumChanges2)
+            end),
         case lists:member(pause, Options) of
         true ->
             % For reliable unit testing, to verify that adding new partitions
@@ -267,7 +270,8 @@ update(WriterAcc, ActiveParts, PassiveParts, BlockedTime,
         try
             {PartVersions, MaxSeqs} = load_changes(
                 Owner, Parent, Group, MapQueue, ActiveParts, PassiveParts,
-                WriterAcc#writer_acc.max_seqs, WriterAcc#writer_acc.initial_build),
+                WriterAcc#writer_acc.max_seqs, WriterAcc#writer_acc.initial_build,
+                StatsPid),
             Parent ! {doc_loader_finished, {PartVersions, MaxSeqs}}
         catch
         throw:purge ->
@@ -434,7 +438,7 @@ filter_dcp_partitions(PartIds, Group, SinceSeqs, AccVersions, InitialBuild) ->
     lists:foldl(FilterFun, [], PartIds).
 
 load_changes(Owner, Updater, Group, MapQueue, ActiveParts, PassiveParts,
-        EndSeqs, InitialBuild) ->
+        EndSeqs, InitialBuild, StatsPid) ->
     #set_view_group{
         set_name = SetName,
         name = DDocId,
@@ -502,21 +506,32 @@ load_changes(Owner, Updater, Group, MapQueue, ActiveParts, PassiveParts,
             (#dcp_doc{} = Item, {Count, AccEndSeq}) ->
                 queue_doc(
                     Item, MapQueue, Group,
-                    MaxDocSize, InitialBuild),
+                    MaxDocSize, InitialBuild, StatsPid),
                 {Count + 1, AccEndSeq}
             end,
 
             couch_dcp_client:enum_docs_since_async(
                 DcpPid, PartIdList, ChangesWrapper, {0, 0}),
 
-            lists:foldl(fun(_Element, {_AccCount1, AccSeqs, AccVersions1, AccRollbacks}) ->
+            lists:foldl(fun(_Element, {AccCount1, AccSeqs, AccVersions1, AccRollbacks}) ->
             receive
             {stream_result, {AccCount2, AccEndSeq}, PartId1, NewPartVersions} ->
                 AccSeqs2 = orddict:store(PartId1, AccEndSeq, AccSeqs),
                 AccVersions2 = lists:ukeymerge(
                     1, [{PartId1, NewPartVersions}], AccVersions1),
                 AccRollbacks2 = AccRollbacks,
-                {AccCount2, AccSeqs2, AccVersions2, AccRollbacks2}
+                {AccCount2, AccSeqs2, AccVersions2, AccRollbacks2};
+            {stream_result, {rollback, RollbackSeq}, PartId1} ->
+                ?LOG_INFO("Rollback requested in view updater ~n", []),
+                AccRollbacks2 = ordsets:add_element(
+                    {PartId1, RollbackSeq}, AccRollbacks),
+                {AccCount1, AccSeqs, AccVersions1, AccRollbacks2};
+            {stream_result, {error, _} = Error, PartId1} ->
+                ?LOG_ERROR("set view `~s`, ~s (~s) group `~s` error"
+                    "while loading changes for partition ~p:~n~p~n",
+                    [SetName, GroupType, Category, DDocId, PartId1,
+                        Error]),
+                throw(Error)
             end end, AccInit, PartIdList)
     end,
 
@@ -612,8 +627,9 @@ queue_doc(snapshot_marker, MapQueue, _Group, _MaxDocSize, _InitialBuild) ->
     couch_work_queue:queue(MapQueue, snapshot_marker);
 queue_doc({part_versions, _} = PartVersions, MapQueue, _Group, _MaxDocSize,
     _InitialBuild) ->
-    couch_work_queue:queue(MapQueue, PartVersions);
-queue_doc(Doc, MapQueue, Group, MaxDocSize, InitialBuild) ->
+    couch_work_queue:queue(MapQueue, PartVersions).
+
+queue_doc(Doc, MapQueue, Group, MaxDocSize, InitialBuild, StatsPid) ->
     case Doc#dcp_doc.deleted of
     true when InitialBuild ->
         Entry = nil;
@@ -654,8 +670,8 @@ queue_doc(Doc, MapQueue, Group, MaxDocSize, InitialBuild) ->
     nil ->
         ok;
     _ ->
-        couch_work_queue:queue(MapQueue, Entry)
-        %update_task(1)
+        couch_work_queue:queue(MapQueue, Entry),
+        update_task(StatsPid, 1)
     end.
 
 
@@ -1355,17 +1371,43 @@ update_seqs(PartIdSeqs, Seqs) ->
 update_versions(PartVersions, AllPartVersions) ->
     lists:ukeymerge(1, PartVersions, AllPartVersions).
 
+receive_update_task(CurrentChanges, TotalChanges) ->
+        case CurrentChanges < TotalChanges of
+        true ->
+            receive
+            {stats_change, NumChanges} ->
+                ?LOG_INFO("received the message with changes ~p~n", [CurrentChanges]),
+                Progress = (NumChanges * 100) div TotalChanges,
+                CurrentChanges2 = CurrentChanges + NumChanges,
+                couch_task_status:update([
+                    {progress, Progress},
+                    {changes_done, CurrentChanges2},
+                    {total_changes, TotalChanges}
+                ]),
+                receive_update_task(CurrentChanges2, TotalChanges)
+            end;
+        false ->
+            ?LOG_INFO("exited the update task ~p~n", [CurrentChanges]),
+            ok
+        end.
 
-update_task(NumChanges) ->
-    [Changes, Total] = couch_task_status:get([changes_done, total_changes]),
-    Changes2 = Changes + NumChanges,
-    Total2 = erlang:max(Total, Changes2),
-    Progress = (Changes2 * 100) div Total2,
-    couch_task_status:update([
-        {progress, Progress},
-        {changes_done, Changes2},
-        {total_changes, Total2}
-    ]).
+update_task(DocLoaderPid, NumChanges) ->
+    %[Changes, Total] = couch_task_status:get([changes_done, total_changes]),
+    %Changes2 = NumChanges,
+    %Total2 = erlang:max(Total, Changes2),
+    %Progress = (Changes2 * 100) div Total2,
+    ?LOG_INFO("sending message to pid ~p ~n", [DocLoaderPid]),
+    case is_pid(DocLoaderPid) of
+    true ->
+        DocLoaderPid ! ({stats_change, NumChanges});
+    false ->
+        ok
+    end.
+   % couch_task_status:update([
+   %     {progress, Progress},
+   %     {changes_done, Changes2},
+   %     {total_changes, Total2}
+   % ]).
 
 
 checkpoint(#writer_acc{owner = Owner, parent = Parent, group = Group} = Acc) ->
