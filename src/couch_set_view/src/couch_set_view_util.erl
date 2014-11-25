@@ -276,6 +276,7 @@ missing_changes_count([], _NewSeqs, MissingCount) ->
 missing_changes_count([{Part, CurSeq} | RestCur], NewSeqs, Acc) ->
     NewSeq = couch_util:get_value(Part, NewSeqs, 0),
     Diff = CurSeq - NewSeq,
+    ?LOG_INFO("diff for each partition ~p ~p ~p ~p~n", [Part, CurSeq, NewSeq, Diff]),
     case Diff > 0 of
     true ->
         missing_changes_count(RestCur, NewSeqs, Acc + Diff);

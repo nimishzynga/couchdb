@@ -1007,6 +1007,7 @@ handle_cast({update, MinNumChanges}, #state{group = Group} = State) ->
     false ->
         ?LOG_INFO(" not returned since updater was running~n", []),
         CurSeqs = indexable_partition_seqs(State),
+        ?LOG_INFO("curr seq are ~p~n", [CurSeqs]),
         MissingCount = couch_set_view_util:missing_changes_count(CurSeqs, ?set_seqs(Group)),
         case (MissingCount >= MinNumChanges) andalso (MissingCount > 0) of
         true ->
@@ -2708,6 +2709,7 @@ cleaner(#state{group = Group}) ->
 -spec indexable_partition_seqs(#state{}) -> partition_seqs().
 indexable_partition_seqs(State) ->
     Partitions = group_partitions(State#state.group),
+    ?LOG_INFO("group partitions are ~p~n", [Partitions]),
     {ok, Seqs} = get_seqs(State, Partitions),
     indexable_partition_seqs(State, Seqs).
 
@@ -2720,6 +2722,7 @@ indexable_partition_seqs(#state{group = Group}, Seqs) ->
         IndexSeqs = ?set_seqs(Group),
         CurPartitions = [P || {P, _} <- IndexSeqs],
         ReplicasOnTransfer = ?set_replicas_on_transfer(Group),
+        ?LOG_INFO("replica on transfer are ~p~n", [ReplicasOnTransfer]),
         Partitions = ordsets:union(CurPartitions, ReplicasOnTransfer),
         % Index unindexable replicas on transfer though (as the reason for the
         % transfer is to become active and indexable).
@@ -4018,6 +4021,7 @@ get_seqs(State, Partitions) ->
     % TODO 2014-08-08 Retry few times (Not applicable for localhost)
     case couch_dcp_client:get_seqs(?dcp_pid(State), nil) of
     {ok, Seqs} ->
+        ?LOG_INFO("got seq from get_seqs are ~p~n", [Seqs]),
         GroupParts = group_partitions(State#state.group),
         Seqs2 = couch_set_view_util:filter_seqs(GroupParts, Seqs),
         SeqsCache = #seqs_cache{
@@ -4027,6 +4031,7 @@ get_seqs(State, Partitions) ->
         },
         erlang:put(seqs_cache, SeqsCache),
         Seqs3 = couch_set_view_util:filter_seqs(Partitions, Seqs2),
+        ?LOG_INFO("got seq filtered from get_seqs are ~p ~p~n", [Partitions, Seqs3]),
         {ok, Seqs3};
     {error, Error} ->
         ?LOG_ERROR("Set view `~s`, ~s (~s) group `~s`, get_seqs() using"
