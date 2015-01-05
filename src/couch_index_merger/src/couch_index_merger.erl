@@ -14,7 +14,7 @@
 
 -module(couch_index_merger).
 
--export([query_index/2, query_index/3]).
+-export([query_index/2, query_index/3, index_folder/7]).
 
 % Only needed for indexer implementation. Those functions should perhaps go into
 % a utils module.
@@ -114,7 +114,7 @@ query_index_loop(Mod, IndexMergeParams, DDoc, IndexName, N) ->
 do_query_index(Mod, IndexMergeParams, DDoc, IndexName) ->
     #index_merge{
        indexes = Indexes, callback = Callback, user_acc = UserAcc,
-       ddoc_revision = DesiredDDocRevision, user_ctx = UserCtx
+       ddoc_revision = DesiredDDocRevision, user_ctx = _UserCtx
     } = IndexMergeParams,
 
     DDocRev = ddoc_rev(DDoc),
@@ -137,7 +137,7 @@ do_query_index(Mod, IndexMergeParams, DDoc, IndexName) ->
         ok
     end,
 
-    {LessFun, FoldFun, MergeFun, CollectorFun, Extra2} = Mod:make_funs(
+    {LessFun, _FoldFun, MergeFun, CollectorFun, Extra2} = Mod:make_funs(
         DDoc, IndexName, IndexMergeParams),
     NumFolders = length(Indexes),
     QueueLessFun = fun
@@ -180,73 +180,26 @@ do_query_index(Mod, IndexMergeParams, DDoc, IndexName) ->
     {ok, Queue} = couch_view_merger_queue:start_link(NumFolders, QueueLessFun),
     Folders = lists:foldr(
         fun(Index, Acc) ->
-            Pid = spawn_link(fun() ->
-                link(Queue),
-                index_folder(Mod, Index, IndexMergeParams, UserCtx, DDoc, Queue, FoldFun)
-            end),
-            [Pid | Acc]
+           % Pid = spawn_link(fun() ->
+                %link(Queue),
+                Out = case get_url_from_spec(Mod, Index, IndexMergeParams, DDoc) of
+                {local, View#set_view{indexer = #mapreduce_view{btree = Btree}}, Filepath, Url} ->
+                    ViewState = couch_btree:get_state(Btree),
+                    <<1:8, byte_size(Url):16, Url/binary, byte_size(ViewState):16, ViewState,
+                        byte_size(Filepath):16, Filepath/binary>>,
+                {remote, Url} ->
+                    <<2:8, byte_size(Url):16, Url/binary>>
+                end
+                %index_folder(Mod, Index, IndexMergeParams, UserCtx, DDoc, Queue, FoldFun)
+           % end),
+            [Out | Acc]
         end,
         [], Indexes),
-    Collector = CollectorFun(NumFolders, Callback, UserAcc),
-    {Skip, Limit} = Mod:get_skip_and_limit(IndexMergeParams#index_merge.http_params),
-    MergeParams = #merge_params{
-        index_name = IndexName,
-        queue = Queue,
-        collector = Collector,
-        skip = Skip,
-        limit = Limit,
-        extra = Extra2
-    },
-    try
-        case MergeFun(MergeParams) of
-        set_view_outdated ->
-            throw({error, set_view_outdated});
-        revision_mismatch ->
-            case DesiredDDocRevision of
-            auto ->
-                throw(retry);
-            OtherDDocRev2 ->
-                ?LOG_ERROR("View merger, revision mismatch for design document `~s',"
-                           " wanted ~s, got ~s",
-                           [DDoc#doc.id,
-                            rev_str(DesiredDDocRevision),
-                            rev_str(OtherDDocRev2)]),
-                throw({error, revision_mismatch})
-            end;
-        {ok, Resp} ->
-            Resp;
-        {stop, Resp} ->
-            Resp
-        end
-    after
-        unlink(Queue),
-        lists:foreach(fun erlang:unlink/1, Folders),
-        % Important, shutdown the queue first. This ensures any blocked
-        % HTTP folders (bloked by queue calls) will get an error/exit and
-        % then stream all the remaining data from the socket, otherwise
-        % the socket can't be reused for future requests.
-        QRef = erlang:monitor(process, Queue),
-        exit(Queue, shutdown),
-        FolderRefs = lists:map(fun(Pid) ->
-                Ref = erlang:monitor(process, Pid),
-                exit(Pid, shutdown),
-                Ref
-            end, Folders),
-        lists:foreach(fun(Ref) ->
-                receive {'DOWN', Ref, _, _, _} -> ok end
-            end, [QRef | FolderRefs]),
-        Reason = clean_exit_messages(normal),
-        process_flag(trap_exit, TrapExitBefore),
-        case Reason of
-        normal ->
-            ok;
-        shutdown ->
-            ok;
-        _ ->
-            exit(Reason)
-        end
-    end.
 
+    ?LOG_INFO("index urls are ~p~n", [Folders]),
+    Data = <<length(Folders):16, Folders>>,
+    PortData = [integer_to_list(byte_size(Data)), $\n, Data]
+    couch_view_merger:send_query_info_data(PortData).
 
 clean_exit_messages(FinalReason) ->
     receive
@@ -627,6 +580,33 @@ parse_error({invalid_value, Reason}) ->
 parse_error(Error) ->
     {error, ?LOCAL, to_binary(Error)}.
 
+get_url_from_spec(_Mod, #set_view_spec{} = SetViewSpec, _MergeParams, _DDoc) ->
+    #set_view_spec{
+        name = SetName,
+        partitions = Partitions0,
+        ddoc_id = DDocId,
+        view_name = ViewName,
+        category = Category
+    } = SetViewSpec,
+    % need to check the indextype for the partition
+    GroupReq = #set_view_group_req{
+        stale = false,
+        update_stats = true,
+        wanted_partitions = Partitions0,
+        debug = false,
+        type = main,
+        category = prod
+    },
+    case couch_view_merger:get_set_view(
+        fun couch_set_view:get_map_view/4, SetName, DDoc, ViewName, GroupReq) of
+    {ok, View, Group#set_view_group{filepath = Filepath, _MissingPartitions} ->
+        {local, View, Filepath, "http://localhost:8092"}
+    end.
+
+get_url_from_spec(Mod, IndexSpec, MergeParams, DDoc) ->
+    {Url, _Method, _Headers, _Body, _BaseOptions} =
+        http_index_folder_req_details(Mod, IndexSpec, MergeParams, DDoc),
+        {remote, Url}.
 
 % Fold function for remote indexes
 http_index_folder(Mod, IndexSpec, MergeParams, DDoc, Queue) ->

@@ -17,7 +17,7 @@
 % export callbacks
 -export([parse_http_params/4, make_funs/3, get_skip_and_limit/1]).
 -export([make_event_fun/2, view_qs/2, process_extra_params/2]).
--export([simple_set_view_query/3]).
+-export([simple_set_view_query/3, send_query_info_data/1]).
 
 % exports for spatial_merger
 -export([queue_debug_info/4, debug_info/3, get_set_view/5,
@@ -1542,46 +1542,106 @@ simple_set_view_query(Params, DDoc, Req) ->
         couch_set_view:release_group(Group)
     end.
 
+send_query_info(Group, Callback, UserAcc) ->
+    case os:find_executable("couch_view_query") of
+    false ->
+        Cmd = nil,
+        throw(<<"couch_view_query command not found">>);
+    Cmd ->
+        ok
+    end,
+    Options = [exit_status, use_stdio, stderr_to_stdout, stream, binary],
+    Port = open_port({spawn_executable, Cmd}, Options),
+    couch_set_view_util:send_group_info(Group, Port),
+    ok = couch_set_view_util:send_group_header(Group, Port),
 
-simple_set_view_map_query(Params, Group, View, ViewArgs) ->
+    {ok, UserAcc2} = Callback({start, 1000}, UserAcc),
+    try query_wait_loop(Port, Group, <<>>, UserAcc2, Callback) of
+    {ok, UserAcc3} ->
+        {ok, UserAcc3}
+    catch
+    Error ->
+        exit(Error)
+    after
+        catch port_close(Port)
+    end.
+
+
+send_query_info_data(Data) ->
+    case os:find_executable("couch_view_query") of
+    false ->
+        Cmd = nil,
+        throw(<<"couch_view_query command not found">>);
+    Cmd ->
+        ok
+    end,
+    Options = [exit_status, use_stdio, stderr_to_stdout, stream, binary],
+    Port = open_port({spawn_executable, Cmd}, Options),
+    true = port_command(Port, [Data, $\n]),
+    {ok, UserAcc2} = Callback({start, 1000}, UserAcc),
+    try query_wait_loop(Port, Group, <<>>, UserAcc2, Callback) of
+    {ok, UserAcc3} ->
+        {ok, UserAcc3}
+    catch
+    Error ->
+        exit(Error)
+    after
+        catch port_close(Port)
+    end.
+
+
+stream_rows(HeaderBin, Callback, UserAcc) ->
+    case HeaderBin of
+    <<RowLen:8, Rest/binary>> ->
+        RowLen2 = RowLen,
+        ?LOG_INFO("row length is ~p~n", [RowLen]),
+        <<Row:RowLen2/binary, Rest2/binary>> = Rest,
+        {ok, UserAcc2} = Callback({row, Row}, UserAcc),
+        ?LOG_INFO("callback called ~n", []),
+        stream_rows(Rest2, Callback, UserAcc2);
+    _False ->
+        UserAcc
+    end.
+
+query_wait_loop(Port, Group, Acc, UserAcc, Callback) ->
+    #set_view_group{
+        set_name = _SetName,
+        name = _DDocId,
+        type = _Type
+    } = Group,
+    {Line, Acc1} = couch_set_view_util:try_read_line(Acc),
+    case Line of
+    nil ->
+        receive
+        {Port, {data, Data}} ->
+            Acc2 = iolist_to_binary([Acc1, Data]),
+            query_wait_loop(Port, Group, Acc2, UserAcc, Callback);
+        {Port, {exit_status, 0}} ->
+            {ok, UserAcc}
+        end;
+    <<"Length ", Data/binary>> ->
+        {ok, [HeaderLen], []} = io_lib:fread("~d", ?b2l(Data)),
+        {ok, HeaderBin, _Rest} = couch_set_view_util:receive_group_header(Port, HeaderLen, Acc1),
+        UserAcc2 = stream_rows(HeaderBin, Callback, UserAcc),
+        {ok, UserAcc2}
+    end.
+
+simple_set_view_map_query(Params, Group, _View, ViewArgs) ->
     #index_merge{
-        indexes = [#set_view_spec{name = SetName}],
+        indexes = [#set_view_spec{name = _SetName}],
         callback = Callback,
         user_acc = UserAcc,
-        user_ctx = UserCtx
+        user_ctx = _UserCtx
     } = Params,
     #view_query_args{
-        include_docs = IncludeDocs,
-        limit = Limit,
-        skip = Skip,
-        debug = DebugMode
+        include_docs = _IncludeDocs,
+        limit = _Limit,
+        skip = _Skip,
+        debug = _DebugMode
     } = ViewArgs,
 
-    FoldFun = fun(_Kv, _, {0, _, _} = Acc) ->
-            {stop, Acc};
-        (_Kv, _, {AccLim, AccSkip, UAcc}) when AccSkip > 0 ->
-            {ok, {AccLim, AccSkip - 1, UAcc}};
-        ({{Key, DocId}, {PartId, Value}} = Kv, _, {AccLim, 0, UAcc}) ->
-            case IncludeDocs of
-            true ->
-                JsonDoc = couch_set_view_http:get_row_doc(
-                    DocId, PartId, SetName, UserCtx, []),
-                RowDetails = {{Key, DocId}, {PartId, Value}, JsonDoc};
-            false ->
-                RowDetails = Kv
-            end,
-            Row = view_row_obj_map(RowDetails, DebugMode),
-            {ok, UAcc2} = Callback({row, Row}, UAcc),
-            {ok, {AccLim - 1, 0, UAcc2}}
-    end,
-
-    RowCount = couch_set_view:get_row_count(Group, View),
-    {ok, UserAcc2} = Callback({start, RowCount}, UserAcc),
-
-    {ok, _, {_, _, UserAcc3}} = couch_set_view:fold(
-        Group, View, FoldFun, {Limit, Skip, UserAcc2}, ViewArgs),
-    Callback(stop, UserAcc3).
-
+    {ok, UserAcc2} = send_query_info(Group, Callback, UserAcc),
+    Callback(stop, UserAcc2).
 
 simple_set_view_reduce_query(Params, Group, View, ViewArgs) ->
     #index_merge{
