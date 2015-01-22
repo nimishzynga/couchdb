@@ -100,9 +100,11 @@ static void doInitContext(map_reduce_ctx_t *ctx, const function_sources_list_t &
 #ifdef V8_POST_3_19_API
 static Local<Context> createJsContext(map_reduce_ctx_t *ctx);
 static void emit(const v8::FunctionCallbackInfo<Value>& args);
+static void log(const v8::FunctionCallbackInfo<Value>& args);
 #else
 static Persistent<Context> createJsContext(map_reduce_ctx_t *ctx);
 static Handle<Value> emit(const Arguments& args);
+static Handle<Value> log(const Arguments& args);
 #endif
 
 static void loadFunctions(map_reduce_ctx_t *ctx, const function_sources_list_t &funs);
@@ -481,6 +483,8 @@ Persistent<Context> createJsContext(map_reduce_ctx_t *ctx)
 
     global->Set(String::New("emit"), FunctionTemplate::New(emit));
 
+    global->Set(String::New("log"), FunctionTemplate::New(log));
+
 #ifdef V8_POST_3_19_API
     Handle<Context> context = Context::New(ctx->isolate, NULL, global);
 #else
@@ -501,6 +505,19 @@ Persistent<Context> createJsContext(map_reduce_ctx_t *ctx)
     return handleScope.Close(context);
 #else
     return context;
+#endif
+}
+
+#ifdef V8_POST_3_19_API
+static void log(const v8::FunctionCallbackInfo<Value>& args)
+#else
+Handle<Value> log(const Arguments& args)
+#endif
+{
+#ifdef V8_POST_3_19_API
+    ThrowException(Handle<Value>(args[0]));
+#else
+    return ThrowException(args[0]);
 #endif
 }
 

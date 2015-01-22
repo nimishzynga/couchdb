@@ -496,9 +496,17 @@ load_changes(Owner, Updater, Group, MapQueue, ActiveParts, PassiveParts,
                                 MaxDocSize, InitialBuild),
                             {Count + 1, AccEndSeq}
                         end,
+
+                    StartTime = erlang:now(),
+                    ?LOG_INFO("vbucket ~p started~n", [PartId]),
                     Result = couch_dcp_client:enum_docs_since(
                         DcpPid, PartId, PartVersions, Since, EndSeq, Flags2,
                         ChangesWrapper, {0, 0}),
+                    ?LOG_INFO("vbucket ~p finished~n", [PartId]),
+                    EndTime = erlang:now(),
+                    TimeTaken = timer:now_diff(EndTime, StartTime),
+                    ?LOG_INFO("vbucket ~p time taken ~p count ~p~n", [PartId, TimeTaken, EndSeq-Since]),
+
                     case Result of
                     {ok, {AccCount2, AccEndSeq}, NewPartVersions} ->
                         AccSeqs2 = orddict:store(PartId, AccEndSeq, AccSeqs),
