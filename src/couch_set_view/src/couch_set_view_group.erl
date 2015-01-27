@@ -119,7 +119,8 @@
     pending_transition_waiters = []    :: [{From::{pid(), reference()}, #set_view_group_req{}}],
     update_listeners = dict:new()      :: dict(),
     compact_log_files = nil            :: 'nil' | {[[string()]], partition_seqs(), partition_versions()},
-    timeout = ?DEFAULT_TIMEOUT         :: non_neg_integer() | 'infinity'
+    timeout = ?DEFAULT_TIMEOUT         :: non_neg_integer() | 'infinity',
+    updater_count = 0
 }).
 
 -define(inc_stat(Group, S),
@@ -2037,8 +2038,14 @@ maybe_update_partition_states(ActiveList0, PassiveList0, CleanupList0, State) ->
     true ->
         State;
     false ->
-        RestartUpdater = updater_needs_restart(
-            Group, ActiveMask, PassiveMask, CleanupMask),
+        #state{updater_count = Count} = State,
+        RestartUpdater = case Count >= 3 of
+        true ->
+            true;
+        _Else ->
+            updater_needs_restart(
+                Group, ActiveMask, PassiveMask, CleanupMask)
+        end,
         NewState = update_partition_states(
             ActiveList, PassiveList, CleanupList, State, RestartUpdater),
         #state{group = NewGroup, updater_pid = UpdaterPid} = NewState,
@@ -2046,14 +2053,14 @@ maybe_update_partition_states(ActiveList0, PassiveList0, CleanupList0, State) ->
         false when is_pid(UpdaterPid) ->
             case missing_partitions(Group, NewGroup) of
             [] ->
-                ok;
+                NewState;
             MissingPassive ->
-                UpdaterPid ! {new_passive_partitions, MissingPassive}
+                UpdaterPid ! {new_passive_partitions, MissingPassive},
+                NewState#state{updater_count = Count + 1}
             end;
         _ ->
-            ok
-        end,
-        NewState
+            NewState
+        end
     end.
 
 
@@ -2825,7 +2832,8 @@ stop_updater(#state{updater_pid = Pid, initial_build = true} = State) when is_pi
     State#state{
         updater_pid = nil,
         initial_build = false,
-        updater_state = not_running
+        updater_state = not_running,
+        updater_count = 0
     };
 stop_updater(#state{updater_pid = Pid} = State) when is_pid(Pid) ->
     MRef = erlang:monitor(process, Pid),
