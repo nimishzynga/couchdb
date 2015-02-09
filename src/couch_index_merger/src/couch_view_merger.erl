@@ -17,7 +17,7 @@
 % export callbacks
 -export([parse_http_params/4, make_funs/3, get_skip_and_limit/1]).
 -export([make_event_fun/2, view_qs/2, process_extra_params/2]).
--export([simple_set_view_query/3]).
+-export([simple_set_view_query/3, simple_set_view_map_query/4]).
 
 % exports for spatial_merger
 -export([queue_debug_info/4, debug_info/3, get_set_view/5,
@@ -433,7 +433,8 @@ get_set_view(GetSetViewFn, SetName, DDoc, ViewName, ViewGroupReq) ->
     update_after ->
         ViewGroupReq;
     false ->
-        ViewGroupReq#set_view_group_req{update_stats = false}
+        %ViewGroupReq#set_view_group_req{update_stats = false}
+        ViewGroupReq
     end,
     case GetSetViewFn(SetName, DDoc, ViewName, ViewGroupReq1) of
     {ok, StaleView, StaleGroup, []} ->
@@ -443,11 +444,12 @@ get_set_view(GetSetViewFn, SetName, DDoc, ViewName, ViewGroupReq) ->
         update_after ->
             {ok, StaleView, StaleGroup, []};
         false ->
-            couch_set_view:release_group(StaleGroup),
-            ViewGroupReq2 = ViewGroupReq#set_view_group_req{
-                update_stats = true
-            },
-            GetSetViewFn(SetName, DDoc, ViewName, ViewGroupReq2)
+            {ok, StaleView, StaleGroup, []}
+            %couch_set_view:release_group(StaleGroup),
+            %ViewGroupReq2 = ViewGroupReq#set_view_group_req{
+            %    update_stats = true
+            %},
+            %GetSetViewFn(SetName, DDoc, ViewName, ViewGroupReq2)
         end;
     Other ->
         Other
@@ -1129,9 +1131,12 @@ simple_set_view_query(Params, DDoc, Req) ->
         category = Category
     },
 
+    T1 = erlang:now(),
     case get_set_view(
         fun couch_set_view:get_map_view/4, SetName, DDoc, ViewName, GroupReq) of
     {ok, View, Group, MissingPartitions} ->
+        T2 = erlang:now(),
+        ?LOG_INFO("time taken in getting group ~p~n", [timer:now_diff(T2,T1)]),
         ViewType = map;
     {not_found, _} ->
         GroupReq2 = GroupReq#set_view_group_req{
@@ -1190,7 +1195,10 @@ simple_set_view_query(Params, DDoc, Req) ->
         reduce ->
             simple_set_view_reduce_query(Params2, Group, View, QueryArgs2);
         _ ->
-            simple_set_view_map_query(Params2, Group, View, QueryArgs2)
+            {Time, Val} = timer:tc(couch_view_merger, simple_set_view_map_query, [Params2, Group, View, QueryArgs2]),
+            ?LOG_INFO("time taken simple_set_view_map_query ~p~n", [Time]),
+            Val
+            %simple_set_view_map_query(Params2, Group, View, QueryArgs2)
         end
     after
         couch_set_view:release_group(Group)

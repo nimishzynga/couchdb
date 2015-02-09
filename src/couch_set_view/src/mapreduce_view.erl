@@ -499,7 +499,10 @@ fold_fun(Fun, [KV | Rest], {KVReds, Reds}, Acc) ->
 
 fold(View, WrapperFun, Acc, Options) ->
     Bt = View#mapreduce_view.btree,
-    couch_btree:fold(Bt, WrapperFun, Acc, Options).
+    {Time, Val} = timer:tc(couch_btree, fold, [Bt, WrapperFun, Acc, Options]),
+    ?LOG_INFO("time taken btree_fold ~p~n", [Time]),
+    Val.
+    %couch_btree:fold(Bt, WrapperFun, Acc, Options).
 
 
 -spec encode_reductions([binary()]) -> [binary()].

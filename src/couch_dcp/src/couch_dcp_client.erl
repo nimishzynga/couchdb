@@ -16,7 +16,7 @@
 % Public API
 -export([start/5]).
 -export([add_stream/6, get_seqs/2, get_num_items/2,
-    get_failover_log/2]).
+    get_failover_log/2, get_seqs1/1]).
 -export([get_stream_event/2, remove_stream/2, list_streams/1]).
 -export([enum_docs_since/8, restart_worker/1]).
 -export([get_seqs_async/1, parse_stats_seqnos/1]).
@@ -118,8 +118,8 @@ get_stats_reply(Pid, MRef) ->
     end.
 
 
--spec get_stats(pid(), binary(), partition_id() | nil) -> term().
-get_stats(Pid, Name, PartId) ->
+-spec get_stats1(pid(), binary(), partition_id() | nil) -> term().
+get_stats1(Pid, Name, PartId) ->
     MRef = erlang:monitor(process, Pid),
     Pid ! {get_stats, Name, PartId, {MRef, self()}},
     Reply = get_stats_reply(Pid, MRef),
@@ -155,7 +155,9 @@ parse_stats_seqnos(Stats) ->
 -spec get_seqs(pid(), ordsets:ordset(partition_id()) | nil) ->
          {ok, partition_seqs()} | {error, term()}.
 get_seqs(Pid, SortedPartIds) ->
-    case get_seqs(Pid) of
+    {Time, Val} = timer:tc(couch_dcp_client, get_seqs1, [Pid]),
+    ?LOG_INFO("time taken get_seqs ~p~n", [Time]),
+    case Val of
     {ok, Seqs} ->
         case SortedPartIds of
         nil ->
@@ -168,11 +170,15 @@ get_seqs(Pid, SortedPartIds) ->
         Error
     end.
 
-get_seqs(Pid) ->
-    Reply = get_stats(Pid, <<"vbucket-seqno">>, nil),
+get_seqs1(Pid) ->
+    Reply =  get_stats1(Pid, <<"vbucket-seqno">>, nil),
+    %?LOG_INFO("time taken get_stats ~p~n", [Time]),
+    %Reply = get_stats(Pid, <<"vbucket-seqno">>, nil),
     case Reply of
     {ok, Stats} ->
-        Seqs = parse_stats_seqnos(Stats),
+        {Time1, Seqs} = timer:tc(couch_dcp_client, parse_stats_seqnos, [Stats]),
+        ?LOG_INFO("time taken parse_stats_seqnos ~p~n", [Time1]),
+        %Seqs = parse_stats_seqnos(Stats),
         {ok, Seqs};
     {error, _Error} = Error ->
         Error
@@ -182,7 +188,7 @@ get_seqs(Pid) ->
 -spec get_num_items(pid(), partition_id()) ->
                            {ok, non_neg_integer()} | {error, not_my_vbucket}.
 get_num_items(Pid, PartId) ->
-    Reply = get_stats(Pid, <<"vbucket-details">>, PartId),
+    Reply = get_stats1(Pid, <<"vbucket-details">>, PartId),
     case Reply of
     {ok, Stats} ->
         BinPartId = list_to_binary(integer_to_list(PartId)),

@@ -56,7 +56,9 @@ query_index(Mod, #index_merge{indexes = [#set_view_spec{}]} = Params, Req) ->
         conn_timeout = Timeout,
         ddoc_revision = DesiredDDocRevision
     } = Params,
-    {ok, DDoc, _} = get_first_ddoc(Indexes, Req#httpd.user_ctx, Timeout),
+    Val = get_first_ddoc(Indexes, Req#httpd.user_ctx, Timeout),
+    %{ok, DDoc, _} = get_first_ddoc(Indexes, Req#httpd.user_ctx, Timeout),
+    {ok, DDoc, _} = Val,
     DDocRev = ddoc_rev(DDoc),
     case should_check_rev(Params, DDoc) of
     true ->
@@ -76,7 +78,10 @@ query_index(Mod, #index_merge{indexes = [#set_view_spec{}]} = Params, Req) ->
     false ->
         ok
     end,
-    Mod:simple_set_view_query(Params, DDoc, Req);
+    {Time1, Val1} = timer:tc(Mod, simple_set_view_query, [Params, DDoc, Req]),
+    ?LOG_INFO("time taken simple_set_view_query ~p~n", [Time1]),
+    Val1;
+    % Mod:simple_set_view_query(Params, DDoc, Req);
 
 query_index(Mod, IndexMergeParams0, #httpd{user_ctx = UserCtx} = Req) ->
     #index_merge{

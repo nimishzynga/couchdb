@@ -93,10 +93,14 @@
                 binary() | #doc{},
                 #set_view_group_req{}) -> {'ok', #set_view_group{}}.
 get_group(Mod, SetName, DDoc, #set_view_group_req{type = main} = Req) ->
+    T1 = erlang:now(),
     GroupPid = get_group_pid(Mod, SetName, DDoc,
         Req#set_view_group_req.category),
+    T2 = erlang:now(),
     case couch_set_view_group:request_group(GroupPid, Req) of
     {ok, Group} ->
+        T3 = erlang:now(),
+        ?LOG_INFO("time taken in get_group ~p ~p~n", [timer:now_diff(T2,T1), timer:now_diff(T3,T2)]),
         {ok, Group};
     {error, view_undefined} ->
         % caller must call ?MODULE:define_group/3
@@ -743,9 +747,13 @@ get_map_view(SetName, DDoc, ViewName, Req) ->
     #set_view_group_req{wanted_partitions = WantedPartitions} = Req,
     try
         {ok, Group0} = get_group(mapreduce_view, SetName, DDoc, Req),
+        T1 = erlang:now(),
         {Group, Unindexed} = modify_bitmasks(Group0, WantedPartitions),
+        T2 = erlang:now(),
         case get_map_view0(ViewName, Group#set_view_group.views) of
         {ok, View} ->
+            T3 = erlang:now(),
+            ?LOG_INFO("time taken in get_map_view ~p ~p~n", [timer:now_diff(T2,T1), timer:now_diff(T3,T2)]),
             {ok, View, Group, Unindexed};
         Else ->
             release_group(Group0),
