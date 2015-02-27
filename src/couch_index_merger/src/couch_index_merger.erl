@@ -41,12 +41,15 @@
 
 
 query_index(Mod, #index_merge{http_params = HttpParams, user_ctx = UserCtx} = IndexMergeParams) when HttpParams =/= nil, UserCtx =/= nil ->
+    Start = erlang:now(),
     #index_merge{
         indexes = Indexes,
         user_ctx = UserCtx,
         conn_timeout = Timeout
     } = IndexMergeParams,
     {ok, DDoc, IndexName} = get_first_ddoc(Indexes, UserCtx, Timeout),
+    End = timer:now_diff(erlang:now(), Start),
+    ?LOG_INFO(" query_perf ~p ~p ~p ~n",[?FILE, ?LINE, End]),
     query_index_loop(Mod, IndexMergeParams, DDoc, IndexName, ?MAX_RETRIES).
 
 % Special and simpler case, trigger a lighter and faster code path.
@@ -111,6 +114,7 @@ query_index_loop(Mod, IndexMergeParams, DDoc, IndexName, N) ->
 
 
 do_query_index(Mod, IndexMergeParams, DDoc, IndexName) ->
+    Start = erlang:now(),
     #index_merge{
        indexes = Indexes, callback = Callback, user_acc = UserAcc,
        ddoc_revision = DesiredDDocRevision, user_ctx = UserCtx
@@ -175,6 +179,10 @@ do_query_index(Mod, IndexMergeParams, DDoc, IndexName) ->
     % Link the queue to the folders, so that if one folder dies, all the others
     % will be killed and not hang forever (mochiweb reuses workers for different
     % requests).
+    End = timer:now_diff(erlang:now(), Start),
+    ?LOG_INFO(" query_perf ~p ~p ~p ~n",[?FILE, ?LINE, End]),
+
+    Start2 = erlang:now(),
     TrapExitBefore = process_flag(trap_exit, true),
     {ok, Queue} = couch_view_merger_queue:start_link(NumFolders, QueueLessFun),
     Folders = lists:foldr(
@@ -186,7 +194,11 @@ do_query_index(Mod, IndexMergeParams, DDoc, IndexName) ->
             [Pid | Acc]
         end,
         [], Indexes),
+    End2 = timer:now_diff(erlang:now(), Start2),
+    ?LOG_INFO(" query_perf ~p ~p ~p ~n",[?FILE, ?LINE, End2]),
     Collector = CollectorFun(NumFolders, Callback, UserAcc),
+    End3 = timer:now_diff(erlang:now(),Start2),
+    ?LOG_INFO(" query_perf ~p ~p ~p ~n",[?FILE, ?LINE, End3]),
     {Skip, Limit} = Mod:get_skip_and_limit(IndexMergeParams#index_merge.http_params),
     MergeParams = #merge_params{
         index_name = IndexName,
@@ -197,7 +209,7 @@ do_query_index(Mod, IndexMergeParams, DDoc, IndexName) ->
         extra = Extra2
     },
     try
-        case MergeFun(MergeParams) of
+        Val = case MergeFun(MergeParams) of
         set_view_outdated ->
             throw({error, set_view_outdated});
         revision_mismatch ->
@@ -216,7 +228,10 @@ do_query_index(Mod, IndexMergeParams, DDoc, IndexName) ->
             Resp;
         {stop, Resp} ->
             Resp
-        end
+        end,
+        End4 = timer:now_diff(erlang:now(), Start2),
+        ?LOG_INFO(" query_perf ~p ~p ~p ~n",[?FILE, ?LINE, End4]),
+        Val
     after
         unlink(Queue),
         lists:foreach(fun erlang:unlink/1, Folders),
