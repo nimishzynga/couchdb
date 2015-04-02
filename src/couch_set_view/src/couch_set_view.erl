@@ -634,6 +634,7 @@ fold_reduce(Group, View, FoldFun, FoldAcc, #view_query_args{keys = nil} = ViewQu
     do_fold_reduce(Group, View, FoldFun, FoldAcc, Options, ViewQueryArgs);
 
 fold_reduce(Group, View, FoldFun, FoldAcc, #view_query_args{keys = Keys} = ViewQueryArgs0) ->
+    Start2 = erlang:now(),
     KeyGroupFun = make_reduce_group_keys_fun(ViewQueryArgs0#view_query_args.group_level),
     {_, FinalAcc} = lists:foldl(
         fun(Key, {_, Acc}) ->
@@ -643,10 +644,13 @@ fold_reduce(Group, View, FoldFun, FoldAcc, #view_query_args{keys = Keys} = ViewQ
         end,
         {ok, FoldAcc},
         Keys),
+    End2 = timer:now_diff(erlang:now(), Start2),
+    ?LOG_INFO(" query_perf ~p ~p ~p ~n",[?FILE, ?LINE, End2]),
     {ok, FinalAcc}.
 
 
 do_fold_reduce(Group, ViewInfo, Fun, Acc, Options0, ViewQueryArgs) ->
+    Start2 = erlang:now(),
     {reduce, NthRed, View} = ViewInfo,
     #mapreduce_view{
         btree = Bt,
@@ -703,6 +707,7 @@ do_fold_reduce(Group, ViewInfo, Fun, Acc, Options0, ViewQueryArgs) ->
             iolist_to_binary([<<0:40, 0:?MAX_NUM_PARTITIONS>> | LenReductions])
         end,
     WrapperFun = fun(KeyDocId, PartialReds, Acc0) ->
+            ?LOG_INFO("wrapper function called", []),
             GroupedKey = case GroupLevel of
             0 ->
                 <<"null">>;
@@ -724,11 +729,21 @@ do_fold_reduce(Group, ViewInfo, Fun, Acc, Options0, ViewQueryArgs) ->
             Fun({json, GroupedKey}, {json, UserRed}, Acc0)
         end,
     couch_set_view_util:open_raw_read_fd(Group),
+    End2 = timer:now_diff(erlang:now(), Start2),
+    ?LOG_INFO(" query_perf ~p ~p ~p ~n",[?FILE, ?LINE, End2]),
     try
-        couch_btree:fold_reduce(Bt, WrapperFun, Acc, Options)
+        Start = erlang:now(),
+        Val = couch_btree:fold_reduce(Bt, WrapperFun, Acc, Options),
+        End = timer:now_diff(erlang:now(), Start),
+        ?LOG_INFO(" query_perf ~p ~p ~p ~n",[?FILE, ?LINE, End]),
+        Val
     after
+        Start1 = erlang:now(),
         couch_set_view_util:close_raw_read_fd(Group),
-        couch_set_view_mapreduce:end_reduce_context(View)
+        Val1 = couch_set_view_mapreduce:end_reduce_context(View),
+        End1 = timer:now_diff(erlang:now(), Start1),
+        ?LOG_INFO(" query_perf ~p ~p ~p ~n",[?FILE, ?LINE, End1]),
+        Val1
     end.
 
 

@@ -1033,7 +1033,8 @@ set_view_group_stats_ejson(Stats) ->
 % Query with a single view to merge, trigger a simpler code path
 % (no queue, no child processes, etc).
 simple_set_view_query(Params, DDoc, Req) ->
-    #index_merge{
+  Start4 = erlang:now(),
+  #index_merge{
         callback = Callback,
         user_acc = UserAcc,
         indexes = [SetViewSpec],
@@ -1068,6 +1069,8 @@ simple_set_view_query(Params, DDoc, Req) ->
         category = Category
     },
 
+
+    Start6 = erlang:now(),
     case get_set_view(
         fun couch_set_view:get_map_view/4, SetName, DDoc, ViewName, GroupReq) of
     {ok, View, Group, MissingPartitions} ->
@@ -1076,6 +1079,7 @@ simple_set_view_query(Params, DDoc, Req) ->
         GroupReq2 = GroupReq#set_view_group_req{
             update_stats = false
         },
+        Start3 = erlang:now(),
         case get_set_view(
             fun couch_set_view:get_reduce_view/4, SetName, DDoc, ViewName, GroupReq2) of
         {ok, ReduceView, Group, MissingPartitions} ->
@@ -1094,8 +1098,12 @@ simple_set_view_query(Params, DDoc, Req) ->
             ErrorMsg = io_lib:format("Error opening view `~s`, from set `~s`, "
                 "design document `~s`: ~p", [ViewName, SetName, DDocId, Error]),
             throw({not_found, iolist_to_binary(ErrorMsg)})
-        end
+        end,
+        End3 = timer:now_diff(erlang:now(), Start3),
+        ?LOG_INFO(" query_perf ~p ~p ~p ~n",[?FILE, ?LINE, End3])
     end,
+    End6 = timer:now_diff(erlang:now(), Start6),
+    ?LOG_INFO(" query_perf ~p ~p ~p ~n",[?FILE, ?LINE, End6]),
 
     case MissingPartitions of
     [] ->
@@ -1107,16 +1115,20 @@ simple_set_view_query(Params, DDoc, Req) ->
         throw({error, set_view_outdated})
     end,
 
+    Start5 = erlang:now(),
     QueryArgs = couch_httpd_view:parse_view_params(Req, Keys, ViewType),
     QueryArgs2 = QueryArgs#view_query_args{
         view_name = ViewName,
         stale = Stale
      },
+    End5 = timer:now_diff(erlang:now(), Start5),
+    ?LOG_INFO(" query_perf ~p ~p ~p ~n",[?FILE, ?LINE, End5]),
 
     case debug_info(Debug, Group, GroupReq) of
     nil ->
         Params2 = Params#index_merge{user_ctx = Req#httpd.user_ctx};
     DebugInfo ->
+        ?LOG_INFO("debug info callback", []),
         {ok, UserAcc2} = Callback(DebugInfo, UserAcc),
         Params2 = Params#index_merge{
             user_ctx = Req#httpd.user_ctx,
@@ -1124,10 +1136,16 @@ simple_set_view_query(Params, DDoc, Req) ->
         }
     end,
 
+    End4 = timer:now_diff(erlang:now(), Start4),
+    ?LOG_INFO(" query_perf ~p ~p ~p ~n",[?FILE, ?LINE, End4]),
     try
         case ViewType of
         reduce ->
-            simple_set_view_reduce_query(Params2, Group, View, QueryArgs2);
+            Start2 = erlang:now(),
+            Val = simple_set_view_reduce_query(Params2, Group, View, QueryArgs2),
+             End2 = timer:now_diff(erlang:now(), Start2),
+             ?LOG_INFO(" query_perf ~p ~p ~p ~n",[?FILE, ?LINE, End2]),
+             Val;
         _ ->
             simple_set_view_map_query(Params2, Group, View, QueryArgs2)
         end

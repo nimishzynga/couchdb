@@ -357,6 +357,7 @@ handle_call({remove_stream, PartId}, From, State) ->
        request_id = RequestId,
        bufsocket = BufSocket
     } = State2,
+    ?LOG_INFO("closing the vbucket", []),
     StreamCloseRequest = couch_dcp_consumer:encode_stream_close(
         PartId, RequestId),
     case bufsocket_send(BufSocket, StreamCloseRequest) of
