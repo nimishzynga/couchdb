@@ -1527,6 +1527,7 @@ maybe_reply_with_group(Waiter, Group, GroupSeqs, ActiveReplicasBitmask) ->
         gen_server:reply(From, {ok, Group, ActiveReplicasBitmask}),
         true;
     false ->
+        ?LOG_INFO("waiter seq no ~p we have ~p", [ClientSeqs, GroupSeqs]),
         false
     end.
 
@@ -3341,6 +3342,7 @@ process_view_group_request(#set_view_group_req{stale = false} = Req, From, State
     {ok, Seqs} = get_seqs(State, Partitions),
     Options = [{seqs, Seqs}],
     CurSeqs = active_partition_seqs(State, Seqs),
+    ?LOG_INFO("cur seq for query is ~p", [CurSeqs]),
     Waiter = #waiter{from = From, debug = Debug, seqs = CurSeqs},
     case reply_with_group(Group, ReplicaParts, [Waiter]) of
     [] ->

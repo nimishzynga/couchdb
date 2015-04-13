@@ -28,7 +28,7 @@
 
 % incremental updates
 -define(INC_MAX_TMP_FILE_SIZE, 31457280).
--define(MIN_BATCH_SIZE_PER_VIEW, 65536).
+-define(MIN_BATCH_SIZE_PER_VIEW, 100).
 
 % For file sorter and file merger commands.
 -define(PORT_OPTS,
@@ -55,7 +55,8 @@
     max_insert_batch_size,
     tmp_files = dict:new(),
     throttle = 0,
-    force_flush = false
+    force_flush = false,
+    last_flush
 }).
 
 receive_parts(Group, MapQueue) ->
@@ -116,6 +117,7 @@ update(Owner, Group, _CurSeqs, CompactorRunning, TmpDir, Options) ->
         initial_build = InitialBuild,
         part_versions = ?set_partition_versions(Group),
         tmp_dir = TmpDir,
+        last_flush = os:timestamp(),
         max_insert_batch_size = list_to_integer(
             couch_config:get("set_views", "indexer_max_insert_batch_size", "1048576"))
     },
@@ -681,6 +683,7 @@ do_writes(Acc) ->
     closed ->
         flush_writes(Acc#writer_acc{final_batch = true});
     {ok, Queue0, QueueSize} ->
+        ?LOG_INFO("got mutation", []),
         Queue = lists:flatten(Queue0),
         Kvs2 = Kvs ++ Queue,
         KvsSize2 = KvsSize + QueueSize,
@@ -691,20 +694,26 @@ do_writes(Acc) ->
         },
         case should_flush_writes(Acc2) of
         true ->
+            ?LOG_INFO("flushing may be due to timeout", []),
             Acc3 = flush_writes(Acc2),
+            ?LOG_INFO("after flush writes", []),
             Acc4 = Acc3#writer_acc{kvs = [], kvs_size = 0};
         false ->
             Acc4 = Acc2
         end,
+        ?LOG_INFO("calling recursive do writes", []),
         do_writes(Acc4)
     end.
 
 should_flush_writes(Acc) ->
     #writer_acc{
         view_empty_kvs = ViewEmptyKvs,
-        kvs_size = KvsSize
+        kvs_size = KvsSize,
+        last_flush = LastFlush
     } = Acc,
-    KvsSize >= (?MIN_BATCH_SIZE_PER_VIEW * length(ViewEmptyKvs)).
+    Duration = timer:now_diff(os:timestamp(), LastFlush) / 1000000,
+    ?LOG_INFO("last flush ~p time ~p duration ~p", [LastFlush, os:timestamp(), Duration]),
+    Duration > 30 orelse KvsSize >= (?MIN_BATCH_SIZE_PER_VIEW * length(ViewEmptyKvs)).
 
 
 flush_writes(#writer_acc{kvs = [], initial_build = false} = Acc) ->
@@ -723,7 +732,7 @@ flush_writes(#writer_acc{initial_build = false} = Acc0) ->
     } = Acc0,
     Mod = Group#set_view_group.mod,
     % Only incremental updates can contain multiple snapshots
-    {MultipleSnapshots, Kvs2} = merge_snapshots(Kvs),
+    {_MultipleSnapshots, Kvs2} = merge_snapshots(Kvs),
     {ViewKVs, DocIdViewIdKeys, NewLastSeqs, NewPartVersions} =
         process_map_results(Mod, Kvs2, ViewEmptyKVs, LastSeqs, PartVersions),
     Acc1 = Acc0#writer_acc{last_seqs = NewLastSeqs, part_versions = NewPartVersions},
@@ -743,13 +752,9 @@ flush_writes(#writer_acc{initial_build = false} = Acc0) ->
             Acc2
         end;
     false ->
-        case MultipleSnapshots of
-        true ->
             Acc2 = maybe_update_btrees(Acc#writer_acc{force_flush = true}),
-            checkpoint(Acc2);
-        false ->
-            Acc
-        end
+            Acc3 = checkpoint(Acc2),
+            Acc3#writer_acc{last_flush = os:timestamp()}
     end;
 
 flush_writes(#writer_acc{initial_build = true} = WriterAcc) ->
@@ -870,15 +875,13 @@ update_transferred_replicas(Group, MaxSeqs, PartIdSeqs) ->
 
 
 -spec update_part_seq(update_seq(), partition_id(), partition_seqs()) -> partition_seqs().
-update_part_seq(_Seq, _PartId, _Acc) ->
-    %case couch_set_view_util:find_part_seq(PartId, Acc) of
-    %{ok, Max} when Max >= Seq ->
-    %    Acc;
-    %_ ->
-    %    orddict:store(PartId, Seq, Acc)
-    %end.
-    ok.
-
+update_part_seq(Seq, PartId, Acc) ->
+    case couch_set_view_util:find_part_seq(PartId, Acc) of
+    {ok, Max} when Max >= Seq ->
+        Acc;
+    _ ->
+        orddict:store(PartId, Seq, Acc)
+    end.
 
 -spec update_part_versions(partition_version(), partition_id(), partition_versions()) ->
     partition_versions().
@@ -1351,7 +1354,7 @@ update_seqs(PartIdSeqs, Seqs) ->
             true ->
                 ok;
             false ->
-                exit({error, <<"New seq smaller or equal than old seq.">>, PartId, OldSeq, NewSeq})
+                ?LOG_INFO("New seq smaller or equal than old seq.~p ~p ~p", [PartId, OldSeq, NewSeq])
             end,
             orddict:store(PartId, NewSeq, Acc)
         end,
