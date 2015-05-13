@@ -3629,6 +3629,8 @@ process_monitor_partition_update(#state{group = Group} = State, PartId, Ref, Pid
     end,
     % This PartId is under transition. Hence get_seqs() method cannot be used.
     % get_seqs() method only returns partition seqnos tracked by the current view group.
+    {ok, AllSeqs} = couch_dcp_client:get_seqs(?dcp_pid(State), nil),
+    ?LOG_INFO("all seqs ~p part id ~p~n", [AllSeqs, PartId]),
     {ok, [{PartId, CurSeq}]} = couch_dcp_client:get_seqs(?dcp_pid(State), [PartId]),
     case IsPending of
     true ->
