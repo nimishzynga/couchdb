@@ -158,6 +158,7 @@ void doInitContext(map_reduce_ctx_t *ctx, const function_sources_list_t &funs,
 {
     ctx->viewType = viewType;
     ctx->isolate = Isolate::New();
+    ctx->logResults = NULL;
     Locker locker(ctx->isolate);
     ctx->logResults = NULL;
     Isolate::Scope isolateScope(ctx->isolate);
