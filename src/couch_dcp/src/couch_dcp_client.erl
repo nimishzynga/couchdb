@@ -159,6 +159,8 @@ get_seqs(Pid, SortedPartIds) ->
             {ok, Seqs};
         _ ->
             Seqs2 = couch_set_view_util:filter_seqs(SortedPartIds, Seqs),
+            Seq3 = get_stats(Pid, <<"vbucket-seqno">>, nil),
+            ?LOG_INFO("Seq are ~p Seq3 are ~p vbucket ~p~n", [Seqs, Seq3, SortedPartIds]),
             {ok, Seqs2}
         end;
     {error, _} = Error ->
