@@ -1477,15 +1477,19 @@ update_btrees(WriterAcc) ->
     mapreduce_view ->
         NewGroup;
     spatial_view = Mod ->
-        process_flag(trap_exit, true),
         ok = couch_file:refresh_eof(NewGroup#set_view_group.fd),
-        Pid = spawn_link(fun() ->
+        {Pid, Mref} = spawn_monitor(fun() ->
             Views = Mod:update_spatial(NewGroup#set_view_group.views, ViewFiles,
                 MaxBatchSize),
             exit({spatial_views_updater_result, Views})
             end),
+        #set_view_group{
+            set_name = SetName,
+            name = DDocId,
+            type = Type
+        } = NewGroup,
         receive
-        {'EXIT', Pid, Result} ->
+        {'DOWN', Mref, process, Pid, Result} ->
             case Result of
             {spatial_views_updater_result, Views} ->
                 NewGroup#set_view_group{
@@ -1495,14 +1499,12 @@ update_btrees(WriterAcc) ->
                     }
                 };
             _ ->
+                ?LOG_ERROR("Set view `~s`, ~s group `~s`, index updater (spatial"
+                          "update) got unexpected result `~p`.",
+                          [SetName, Type, DDocId, Result]),
                 exit(Result)
             end;
         stop ->
-            #set_view_group{
-                set_name = SetName,
-                name = DDocId,
-                type = Type
-            } = NewGroup,
             ?LOG_INFO("Set view `~s`, ~s group `~s`, index updater (spatial"
                       "update) stopped successfully.", [SetName, Type, DDocId]),
             couch_util:shutdown_sync(Pid),
